@@ -457,7 +457,7 @@ cJSON* GRPCParser::parse(const Intent& o) {
 	return json;
 }
 
-cJSON* GRPCParser::parse(const google::cloud::dialogflow::v2beta1::Context& o) {
+cJSON* GRPCParser::parse(const google::cloud::dialogflow::v2::Context& o) {
     cJSON * json = cJSON_CreateObject();
 
 	cJSON_AddItemToObject(json, "name", cJSON_CreateString(o.name().c_str()));

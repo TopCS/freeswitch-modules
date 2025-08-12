@@ -43,7 +43,7 @@ To simply use the defaults for both environment and region:
 dialogflow-project-id, i.e myproject
 ```
 
-By default, [Output Audio configurations](https://cloud.google.com/dialogflow/es/docs/reference/rest/v2/OutputAudioConfig) and [Sentiment Analysis](https://cloud.google.com/dialogflow/es/docs/reference/rpc/google.cloud.dialogflow.v2beta1#google.cloud.dialogflow.v2beta1.SentimentAnalysisRequestConfig) will be ignored and the configs selected for [your agent in Dialogflow platform](https://dialogflow.cloud.google.com/) will be used, however if you wish to abstract your implementation from the platform and define them programatically it can be done in the dialogflow_start command as follows:
+By default, [Output Audio configurations](https://cloud.google.com/dialogflow/es/docs/reference/rest/v2/OutputAudioConfig) and [Sentiment Analysis](https://cloud.google.com/dialogflow/es/docs/reference/rpc/google.cloud.dialogflow.v2#google.cloud.dialogflow.v2.SentimentAnalysisRequestConfig) will be ignored and the configs selected for [your agent in Dialogflow platform](https://dialogflow.cloud.google.com/) will be used, however if you wish to abstract your implementation from the platform and define them programatically it can be done in the dialogflow_start command as follows:
 
 ```
 dialogflow-project-id:environment:region:speakingRate:pitch:volume:voice-name:voice-gender:effect:sentiment-analysis
