@@ -225,6 +225,14 @@ SWITCH_STANDARD_API(dialogflow_api_stop_function)
 
 
 /* Macro expands to: switch_status_t mod_dialogflow_load(switch_loadable_module_interface_t **module_interface, switch_memory_pool_t *pool) */
+static switch_bool_t g_reserved_intent = SWITCH_FALSE;
+static switch_bool_t g_reserved_transcription = SWITCH_FALSE;
+static switch_bool_t g_reserved_eou = SWITCH_FALSE;
+static switch_bool_t g_reserved_audio = SWITCH_FALSE;
+static switch_bool_t g_reserved_error = SWITCH_FALSE;
+static switch_bool_t g_reserved_transfer = SWITCH_FALSE;
+static switch_bool_t g_reserved_end_session = SWITCH_FALSE;
+
 SWITCH_MODULE_LOAD_FUNCTION(mod_dialogflow_load)
 {
 	switch_api_interface_t *api_interface;
@@ -233,24 +241,34 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_dialogflow_load)
 	if (switch_event_reserve_subclass(DIALOGFLOW_EVENT_INTENT) != SWITCH_STATUS_SUCCESS) {
 		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Couldn't register subclass %s!\n", DIALOGFLOW_EVENT_INTENT);
 		return SWITCH_STATUS_TERM;
-	}
+	} else g_reserved_intent = SWITCH_TRUE;
 	if (switch_event_reserve_subclass(DIALOGFLOW_EVENT_TRANSCRIPTION) != SWITCH_STATUS_SUCCESS) {
 		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Couldn't register subclass %s!\n", DIALOGFLOW_EVENT_TRANSCRIPTION);
 		return SWITCH_STATUS_TERM;
-	}
+	} else g_reserved_transcription = SWITCH_TRUE;
 	if (switch_event_reserve_subclass(DIALOGFLOW_EVENT_END_OF_UTTERANCE) != SWITCH_STATUS_SUCCESS) {
 		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Couldn't register subclass %s!\n", DIALOGFLOW_EVENT_END_OF_UTTERANCE);
 		return SWITCH_STATUS_TERM;
-	}
+	} else g_reserved_eou = SWITCH_TRUE;
 	if (switch_event_reserve_subclass(DIALOGFLOW_EVENT_AUDIO_PROVIDED) != SWITCH_STATUS_SUCCESS) {
 		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Couldn't register subclass %s!\n", DIALOGFLOW_EVENT_AUDIO_PROVIDED);
 		return SWITCH_STATUS_TERM;
-	}
+	} else g_reserved_audio = SWITCH_TRUE;
 
 	if (switch_event_reserve_subclass(DIALOGFLOW_EVENT_ERROR) != SWITCH_STATUS_SUCCESS) {
 		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Couldn't register subclass %s!\n", DIALOGFLOW_EVENT_ERROR);
 		return SWITCH_STATUS_TERM;
-	}
+	} else g_reserved_error = SWITCH_TRUE;
+
+	if (switch_event_reserve_subclass(DIALOGFLOW_EVENT_TRANSFER) != SWITCH_STATUS_SUCCESS) {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Couldn't register subclass %s!\n", DIALOGFLOW_EVENT_TRANSFER);
+		return SWITCH_STATUS_TERM;
+	} else g_reserved_transfer = SWITCH_TRUE;
+
+	if (switch_event_reserve_subclass(DIALOGFLOW_EVENT_END_SESSION) != SWITCH_STATUS_SUCCESS) {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Couldn't register subclass %s!\n", DIALOGFLOW_EVENT_END_SESSION);
+		return SWITCH_STATUS_TERM;
+	} else g_reserved_end_session = SWITCH_TRUE;
 
 
 	/* connect my internal structure to the blank pointer passed to me */
@@ -283,11 +301,13 @@ SWITCH_MODULE_SHUTDOWN_FUNCTION(mod_dialogflow_shutdown)
 {
 	google_dialogflow_cleanup();
 
-	switch_event_free_subclass(DIALOGFLOW_EVENT_INTENT);
-	switch_event_free_subclass(DIALOGFLOW_EVENT_TRANSCRIPTION);
-	switch_event_free_subclass(DIALOGFLOW_EVENT_END_OF_UTTERANCE);
-	switch_event_free_subclass(DIALOGFLOW_EVENT_AUDIO_PROVIDED);
-	switch_event_free_subclass(DIALOGFLOW_EVENT_ERROR);
+	if (g_reserved_intent) { switch_event_free_subclass(DIALOGFLOW_EVENT_INTENT); g_reserved_intent = SWITCH_FALSE; }
+	if (g_reserved_transcription) { switch_event_free_subclass(DIALOGFLOW_EVENT_TRANSCRIPTION); g_reserved_transcription = SWITCH_FALSE; }
+	if (g_reserved_eou) { switch_event_free_subclass(DIALOGFLOW_EVENT_END_OF_UTTERANCE); g_reserved_eou = SWITCH_FALSE; }
+	if (g_reserved_audio) { switch_event_free_subclass(DIALOGFLOW_EVENT_AUDIO_PROVIDED); g_reserved_audio = SWITCH_FALSE; }
+	if (g_reserved_error) { switch_event_free_subclass(DIALOGFLOW_EVENT_ERROR); g_reserved_error = SWITCH_FALSE; }
+	if (g_reserved_transfer) { switch_event_free_subclass(DIALOGFLOW_EVENT_TRANSFER); g_reserved_transfer = SWITCH_FALSE; }
+	if (g_reserved_end_session) { switch_event_free_subclass(DIALOGFLOW_EVENT_END_SESSION); g_reserved_end_session = SWITCH_FALSE; }
 
 	return SWITCH_STATUS_SUCCESS;
 }

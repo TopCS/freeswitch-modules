@@ -12,6 +12,8 @@
 #define DIALOGFLOW_EVENT_AUDIO_PROVIDED "dialogflow::audio_provided"
 #define DIALOGFLOW_EVENT_END_OF_UTTERANCE "dialogflow::end_of_utterance"
 #define DIALOGFLOW_EVENT_ERROR "dialogflow::error"
+#define DIALOGFLOW_EVENT_TRANSFER "dialogflow::transfer"
+#define DIALOGFLOW_EVENT_END_SESSION "dialogflow::end_session"
 
 #define MAX_LANG (12)
 #define MAX_PROJECT_ID (128)

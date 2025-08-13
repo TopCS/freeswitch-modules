@@ -1,0 +1,27 @@
+<include>
+  <!-- Sample dialplan for Dialogflow CX integration -->
+  <extension name="dialogflow_demo">
+    <condition field="destination_number" expression="^1000$">
+      <!-- Recommended variables -->
+      <action application="set" data="GOOGLE_APPLICATION_CREDENTIALS=/path/to/service_account.json"/>
+      <action application="set" data="DIALOGFLOW_CHANNEL=voice"/>
+      <action application="set" data="DIALOGFLOW_AUTOPLAY=true"/>
+      <!-- Pass selected channel vars into QueryParameters -->
+      <action application="set" data="DIALOGFLOW_PASS_ALL_CHANNEL_VARS=true"/>
+      <action application="set" data="DIALOGFLOW_VAR_PREFIXES=caller_,sip_"/>
+      <!-- End/Transfer handling -->
+      <action application="set" data="DIALOGFLOW_END_SESSION_INTENT=END SESSION"/>
+      <action application="set" data="DIALOGFLOW_TRANSFER_INTENT=TRANSFER TO HUMAN"/>
+      <action application="set" data="DIALOGFLOW_TRANSFER_CONTEXT=default"/>
+      <action application="set" data="DIALOGFLOW_TRANSFER_DIALPLAN=XML"/>
+
+      <action application="answer"/>
+      <!-- Start Dialogflow on this channel (replace project:agent:environment accordingly) -->
+      <action application="api" data="dialogflow_start ${uuid} myproject:myagent:production en-US welcome"/>
+
+      <!-- Optional: wait here to keep the call alive while Dialogflow drives the flow -->
+      <action application="park"/>
+    </condition>
+  </extension>
+</include>
+

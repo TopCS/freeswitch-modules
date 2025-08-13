@@ -7,4 +7,5 @@ mod_dialogflow_la_CFLAGS   = $(AM_CFLAGS)
 mod_dialogflow_la_CXXFLAGS = -I $(top_srcdir)/libs/googleapis/gens $(AM_CXXFLAGS) -std=c++17
 
 mod_dialogflow_la_LIBADD   = $(switch_builddir)/libfreeswitch.la
-mod_dialogflow_la_LDFLAGS  = -avoid-version -module -no-undefined -shared `pkg-config --libs grpc++ grpc` 
+mod_dialogflow_la_LDFLAGS  = -avoid-version -module -no-undefined -shared \
+    `pkg-config --libs grpc++ grpc protobuf`
