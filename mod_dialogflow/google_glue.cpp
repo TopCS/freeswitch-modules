@@ -296,6 +296,8 @@ public:
             if (js && *js) {
                 cJSON* json = cJSON_Parse(js);
                 if (json) {
+                    // Remember original request params JSON for event echoing
+                    m_requestParamsJSON = js;
                     have_params = true;
                     // If JSON includes a top-level "channel", set QueryParameters.channel too
                     cJSON* chv = cJSON_GetObjectItemCaseSensitive(json, "channel");
@@ -385,6 +387,7 @@ public:
             if (js && *js) {
                 cJSON* json2 = cJSON_Parse(js);
                 if (json2) {
+                    m_requestParamsJSON = js;
                     cJSON* chv2 = cJSON_GetObjectItemCaseSensitive(json2, "channel");
                     if (cJSON_IsString(chv2) && chv2->valuestring && chv2->valuestring[0]) {
                         m_request->mutable_query_params()->set_channel(chv2->valuestring);
@@ -512,6 +515,7 @@ public:
     bool isPaused() const { return m_paused.load(); }
 
     const std::string& qpChannel() const { return m_qpChannel; }
+    const std::string& requestParamsJSON() const { return m_requestParamsJSON; }
 
     void rotateToAudioConfig(switch_core_session_t* session) {
         switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO,
@@ -599,6 +603,7 @@ private:
     bool m_startedWithEvent;
     bool m_rotatedToAudio;
     std::string m_qpChannel;
+    std::string m_requestParamsJSON;
 };
 
 static void killcb(struct cap_cb* cb) {
@@ -633,6 +638,20 @@ static void *SWITCH_THREAD_FUNC grpc_read_thread(switch_thread_t *thread, void *
 
 				if (response.has_detect_intent_response() || response.has_recognition_result()) {
 					cJSON* jResponse = parser.parse(response) ;
+					// Optionally include request query_params on all DF events
+					bool include_qp = switch_true(switch_channel_get_variable(channel, "DIALOGFLOW_INCLUDE_QUERY_PARAMS"));
+					if (include_qp) {
+						cJSON* jq = cJSON_CreateObject();
+						if (!streamer->qpChannel().empty()) {
+							cJSON_AddItemToObject(jq, "channel", cJSON_CreateString(streamer->qpChannel().c_str()));
+						}
+						if (!streamer->requestParamsJSON().empty()) {
+							cJSON* pl = cJSON_Parse(streamer->requestParamsJSON().c_str());
+							if (pl) cJSON_AddItemToObject(jq, "payload", pl);
+							else cJSON_AddItemToObject(jq, "payload", cJSON_CreateString(streamer->requestParamsJSON().c_str()));
+						}
+						cJSON_AddItemToObject(jResponse, "query_params", jq);
+					}
 					char* json = cJSON_PrintUnformatted(jResponse);
 					const char* type = DIALOGFLOW_EVENT_TRANSCRIPTION;
 
@@ -727,10 +746,18 @@ static void *SWITCH_THREAD_FUNC grpc_read_thread(switch_thread_t *thread, void *
                             cJSON* jp = parser.parseStruct(qr.parameters());
                             cJSON_AddItemToObject(j, "parameters", jp);
                         }
-                        // Include request query_params (channel) if available
-                        if (!streamer->qpChannel().empty()) {
+                        // Include request query_params if requested
+                        bool include_qp = switch_true(switch_channel_get_variable(channel, "DIALOGFLOW_INCLUDE_QUERY_PARAMS"));
+                        if (include_qp) {
                             cJSON* jq = cJSON_CreateObject();
-                            cJSON_AddItemToObject(jq, "channel", cJSON_CreateString(streamer->qpChannel().c_str()));
+                            if (!streamer->qpChannel().empty()) {
+                                cJSON_AddItemToObject(jq, "channel", cJSON_CreateString(streamer->qpChannel().c_str()));
+                            }
+                            if (!streamer->requestParamsJSON().empty()) {
+                                cJSON* pl = cJSON_Parse(streamer->requestParamsJSON().c_str());
+                                if (pl) cJSON_AddItemToObject(jq, "payload", pl);
+                                else cJSON_AddItemToObject(jq, "payload", cJSON_CreateString(streamer->requestParamsJSON().c_str()));
+                            }
                             cJSON_AddItemToObject(j, "query_params", jq);
                         }
                         char* body = cJSON_PrintUnformatted(j);
@@ -801,10 +828,18 @@ static void *SWITCH_THREAD_FUNC grpc_read_thread(switch_thread_t *thread, void *
                                     cJSON* jp = parser.parseStruct(qr.parameters());
                                     cJSON_AddItemToObject(j, "parameters", jp);
                                 }
-                                // Include request query_params (channel) if available
-                                if (!streamer->qpChannel().empty()) {
+                                // Include request query_params if requested
+                                bool include_qp2 = switch_true(switch_channel_get_variable(channel, "DIALOGFLOW_INCLUDE_QUERY_PARAMS"));
+                                if (include_qp2) {
                                     cJSON* jq = cJSON_CreateObject();
-                                    cJSON_AddItemToObject(jq, "channel", cJSON_CreateString(streamer->qpChannel().c_str()));
+                                    if (!streamer->qpChannel().empty()) {
+                                        cJSON_AddItemToObject(jq, "channel", cJSON_CreateString(streamer->qpChannel().c_str()));
+                                    }
+                                    if (!streamer->requestParamsJSON().empty()) {
+                                        cJSON* pl = cJSON_Parse(streamer->requestParamsJSON().c_str());
+                                        if (pl) cJSON_AddItemToObject(jq, "payload", pl);
+                                        else cJSON_AddItemToObject(jq, "payload", cJSON_CreateString(streamer->requestParamsJSON().c_str()));
+                                    }
                                     cJSON_AddItemToObject(j, "query_params", jq);
                                 }
                                 char* body = cJSON_PrintUnformatted(j);
