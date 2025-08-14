@@ -8,6 +8,7 @@
 #include <condition_variable>
 #include <atomic>
 #include <stdexcept>
+#include <cerrno>
 
 #include <regex>
 
@@ -107,6 +108,17 @@ static inline std::string trim(const std::string& s) {
     return s.substr(b, e - b + 1);
 }
 
+static bool parseDoubleStrict(const std::string& s, double& out) {
+    if (s.empty()) return false;
+    char* end = nullptr;
+    errno = 0;
+    out = std::strtod(s.c_str(), &end);
+    if (errno != 0 || end == s.c_str() || *end != '\0') {
+        return false;
+    }
+    return true;
+}
+
 static void splitCSV(const char* csv, std::vector<std::string>& out) {
     if (!csv || !*csv) return;
     std::string s(csv);
@@ -193,9 +205,15 @@ public:
             else if (1 == idx && s.length() > 0) m_agentId = s;
             else if (2 == idx && s.length() > 0) m_environment = s;
             else if (3 == idx && s.length() > 0) m_regionId = s;
-            else if (4 == idx && s.length() > 0) m_speakingRate = stod(s);
-            else if (5 == idx && s.length() > 0) m_pitch = stod(s);
-            else if (6 == idx && s.length() > 0) m_volume = stod(s);
+            else if (4 == idx && s.length() > 0) {
+                double v; if (parseDoubleStrict(s, v)) m_speakingRate = v; else switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING, "GStreamer: ignoring non-numeric speakingRate '%s'\n", s.c_str());
+            }
+            else if (5 == idx && s.length() > 0) {
+                double v; if (parseDoubleStrict(s, v)) m_pitch = v; else switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING, "GStreamer: ignoring non-numeric pitch '%s'\n", s.c_str());
+            }
+            else if (6 == idx && s.length() > 0) {
+                double v; if (parseDoubleStrict(s, v)) m_volume = v; else switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING, "GStreamer: ignoring non-numeric volume '%s'\n", s.c_str());
+            }
             else if (7 == idx && s.length() > 0) m_voiceName = s;
             else if (8 == idx && s.length() > 0) m_voiceGender = s;
             else if (9 == idx && s.length() > 0) m_effects = s;
