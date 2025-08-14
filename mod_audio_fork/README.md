@@ -6,6 +6,40 @@ A Freeswitch module that attaches a bug to a media server endpoint and streams L
 - MOD_AUDIO_FORK_SUBPROTOCOL_NAME - optional, name of the [websocket sub-protocol](https://tools.ietf.org/html/rfc6455#section-1.9) to advertise; defaults to "audio.drachtio.org"
 - MOD_AUDIO_FORK_SERVICE_THREADS - optional, number of libwebsocket service threads to create; these threads handling sending all messages for all sessions.  Defaults to 1, but can be set to as many as 5.
 
+## Standalone Build
+This module can be built outside the FreeSWITCH source tree using CMake.
+
+### Dependencies
+Install the required development packages. On Debian/Ubuntu:
+
+```
+sudo apt-get install -y \
+  build-essential cmake pkg-config \
+  libfreeswitch-dev libwebsockets-dev libspeexdsp-dev
+```
+
+If you built FreeSWITCH from source and installed it under `/usr/local/freeswitch`, set the pkg-config path:
+
+```
+export PKG_CONFIG_PATH=/usr/local/freeswitch/lib/pkgconfig:$PKG_CONFIG_PATH
+```
+
+Alternatively, you can pass `-DENABLE_LOCAL=ON` to CMake to use the same path automatically during configuration.
+
+### Build and Install
+
+```
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release [-DENABLE_LOCAL=ON]
+cmake --build build -j
+sudo cmake --install build
+```
+
+The module installs into FreeSWITCH’s `modulesdir` reported by:
+
+```
+pkg-config freeswitch --variable=modulesdir
+```
+
 ## API
 
 ### Commands
@@ -183,5 +217,3 @@ And in the second window run:
 node audio_fork.js http://localhost:3001
 ```
 The app uses text-to-speech to play prompts, so you will need mod_google_tts loaded as well, and configured to use your GCS cloud credentials to access Google Cloud Text-to-Speech.  (If you don't want to run mod_google_tts you can of course simply modify the application remove the prompt, just be aware that you will hear silence when you connect, and should simply begin speaking after the call connects).
-
-
