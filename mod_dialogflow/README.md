@@ -59,8 +59,8 @@ Stops dialogflow on the channel.
 * `dialogflow::audio_provided` - an audio prompt has been returned from Dialogflow. The module writes the audio to a temporary file and fires this event with JSON `{ "path": "/tmp/....wav|.mp3|.opus" }`. Playback is not automatic unless `DIALOGFLOW_AUTOPLAY` is enabled.
 * `dialogflow::end_of_utterance` - dialogflow has detected the end of an utterance
 * `dialogflow::error` - dialogflow has returned an error
-* `dialogflow::transfer` - module is about to transfer the call; JSON body includes `exten`, `context`, `dialplan`, `intent_display_name`.
-* `dialogflow::end_session` - module is about to end the session; JSON body includes `intent_display_name`.
+* `dialogflow::transfer` - module is about to transfer the call; JSON body includes `exten`, `context`, `dialplan`, `intent_display_name`. Also includes `parameters` (from Dialogflow QueryResult) and, when enabled, `query_params`.
+* `dialogflow::end_session` - module is about to end the session; JSON body includes `intent_display_name`. Also includes `parameters` (from Dialogflow QueryResult) and, when enabled, `query_params`.
 
 ### Dialplan Variables
 - `DIALOGFLOW_CHANNEL`: Optional logical channel name to set `QueryParameters.channel` and include in parameters.
@@ -68,6 +68,10 @@ Stops dialogflow on the channel.
 - `DIALOGFLOW_AUTOPLAY`: If `true`, auto-play returned TTS on the A-leg.
 - `DIALOGFLOW_AUTOPLAY_SYNC`: When `true` and `DIALOGFLOW_AUTOPLAY` is enabled, play the agent audio synchronously and block the next user turn until playback completes. Defaults to `true` when `DIALOGFLOW_AUTOPLAY` is set. Set to `false` to retain legacy async `uuid_broadcast` behavior.
 - `DIALOGFLOW_BARGE_IN`: When `true`, do not block listening during agent playback (barge-in enabled). Defaults to `false`.
+
+- `DIALOGFLOW_INCLUDE_QUERY_PARAMS`: When `true`, all Dialogflow events emitted by the module include a `query_params` object with:
+  - `channel`: the request-side `QueryParameters.channel` if set (via `DIALOGFLOW_CHANNEL` or JSON `channel`).
+  - `payload`: the exact JSON provided in `DIALOGFLOW_PARAMS` (echoed as an object when valid, otherwise omitted).
 
 - `DIALOGFLOW_PASS_ALL_CHANNEL_VARS`: When `true`, include all channel variables as string `QueryParameters.parameters`.
 - `DIALOGFLOW_VAR_PREFIXES`: Optional comma-separated allowlist of prefixes to include when above is enabled (e.g., `sip_,caller_,origination_`).
