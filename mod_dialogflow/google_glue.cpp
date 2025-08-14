@@ -511,6 +511,8 @@ public:
 
     bool isPaused() const { return m_paused.load(); }
 
+    const std::string& qpChannel() const { return m_qpChannel; }
+
     void rotateToAudioConfig(switch_core_session_t* session) {
         switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO,
             "GStreamer: rotating stream to audio mode for next user turn\n");
@@ -720,6 +722,17 @@ static void *SWITCH_THREAD_FUNC grpc_read_thread(switch_thread_t *thread, void *
                         cJSON* j = cJSON_CreateObject();
                         cJSON_AddItemToObject(j, "intent_display_name", cJSON_CreateString(disp.c_str()));
                         if (!page_disp.empty()) cJSON_AddItemToObject(j, "page_display_name", cJSON_CreateString(page_disp.c_str()));
+                        // Include response parameters if any
+                        if (qr.has_parameters()) {
+                            cJSON* jp = parser.parse(qr.parameters());
+                            cJSON_AddItemToObject(j, "parameters", jp);
+                        }
+                        // Include request query_params (channel) if available
+                        if (!streamer->qpChannel().empty()) {
+                            cJSON* jq = cJSON_CreateObject();
+                            cJSON_AddItemToObject(jq, "channel", cJSON_CreateString(streamer->qpChannel().c_str()));
+                            cJSON_AddItemToObject(j, "query_params", jq);
+                        }
                         char* body = cJSON_PrintUnformatted(j);
                         switch_event_t* ev = nullptr;
                         if (switch_event_create_subclass(&ev, SWITCH_EVENT_CUSTOM, DIALOGFLOW_EVENT_END_SESSION) == SWITCH_STATUS_SUCCESS) {
@@ -783,6 +796,17 @@ static void *SWITCH_THREAD_FUNC grpc_read_thread(switch_thread_t *thread, void *
                                 cJSON_AddItemToObject(j, "dialplan", cJSON_CreateString(dp.c_str()));
                                 cJSON_AddItemToObject(j, "intent_display_name", cJSON_CreateString(disp.c_str()));
                                 if (!page_disp.empty()) cJSON_AddItemToObject(j, "page_display_name", cJSON_CreateString(page_disp.c_str()));
+                                // Include response parameters if any (so listeners can see matched values)
+                                if (qr.has_parameters()) {
+                                    cJSON* jp = parser.parse(qr.parameters());
+                                    cJSON_AddItemToObject(j, "parameters", jp);
+                                }
+                                // Include request query_params (channel) if available
+                                if (!streamer->qpChannel().empty()) {
+                                    cJSON* jq = cJSON_CreateObject();
+                                    cJSON_AddItemToObject(jq, "channel", cJSON_CreateString(streamer->qpChannel().c_str()));
+                                    cJSON_AddItemToObject(j, "query_params", jq);
+                                }
                                 char* body = cJSON_PrintUnformatted(j);
                                 switch_event_t* ev = nullptr;
                                 if (switch_event_create_subclass(&ev, SWITCH_EVENT_CUSTOM, DIALOGFLOW_EVENT_TRANSFER) == SWITCH_STATUS_SUCCESS) {
