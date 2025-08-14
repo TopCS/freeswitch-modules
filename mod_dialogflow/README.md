@@ -56,7 +56,7 @@ Stops dialogflow on the channel.
 ### Events
 * `dialogflow::intent` - a dialogflow [intent](https://dialogflow.com/docs/intents) has been detected.
 * `dialogflow::transcription` - a transcription has been returned
-* `dialogflow::audio_provided` - an audio prompt has been returned from dialogflow.  Dialogflow will return both an audio clip in linear 16 format, as well as the text of the prompt.  The audio clip will be played out to the caller and the prompt text is returned to the application in this event.
+* `dialogflow::audio_provided` - an audio prompt has been returned from Dialogflow. The module writes the audio to a temporary file and fires this event with JSON `{ "path": "/tmp/....wav|.mp3|.opus" }`. Playback is not automatic unless `DIALOGFLOW_AUTOPLAY` is enabled.
 * `dialogflow::end_of_utterance` - dialogflow has detected the end of an utterance
 * `dialogflow::error` - dialogflow has returned an error
 * `dialogflow::transfer` - module is about to transfer the call; JSON body includes `exten`, `context`, `dialplan`, `intent_display_name`.
