@@ -65,7 +65,9 @@ Stops dialogflow on the channel.
 ### Dialplan Variables
 - `DIALOGFLOW_CHANNEL`: Optional logical channel name to set `QueryParameters.channel` and include in parameters.
 - `DIALOGFLOW_PARAMS`: Optional JSON string merged into `QueryParameters.parameters` on start.
-- `DIALOGFLOW_AUTOPLAY`: If `true`, auto-play returned TTS on the A-leg via `uuid_broadcast`.
+- `DIALOGFLOW_AUTOPLAY`: If `true`, auto-play returned TTS on the A-leg.
+- `DIALOGFLOW_AUTOPLAY_SYNC`: When `true` and `DIALOGFLOW_AUTOPLAY` is enabled, play the agent audio synchronously and block the next user turn until playback completes. Defaults to `true` when `DIALOGFLOW_AUTOPLAY` is set. Set to `false` to retain legacy async `uuid_broadcast` behavior.
+- `DIALOGFLOW_BARGE_IN`: When `true`, do not block listening during agent playback (barge-in enabled). Defaults to `false`.
 
 - `DIALOGFLOW_PASS_ALL_CHANNEL_VARS`: When `true`, include all channel variables as string `QueryParameters.parameters`.
 - `DIALOGFLOW_VAR_PREFIXES`: Optional comma-separated allowlist of prefixes to include when above is enabled (e.g., `sip_,caller_,origination_`).
@@ -82,6 +84,12 @@ Stops dialogflow on the channel.
 Notes:
 - Transfer intent also honors DF parameters if present: `transfer_to`/`transfer_target`/`destination`/`exten`, plus optional `context` and `dialplan`.
 - Be cautious when enabling `DIALOGFLOW_PASS_ALL_CHANNEL_VARS`; prefer `DIALOGFLOW_VAR_PREFIXES` to limit sensitive data exposure.
+
+### Turn Timing During Playback
+By default, when `DIALOGFLOW_AUTOPLAY` is enabled the module now avoids opening a new Dialogflow turn until the returned agent audio has finished playing. This prevents spurious `no_input` while the caller is listening to long prompts.
+
+- To keep barge-in enabled, set `DIALOGFLOW_BARGE_IN=true`.
+- To revert to legacy async playback (which may start a new turn during playback), set `DIALOGFLOW_AUTOPLAY_SYNC=false`.
 ## Usage
 When using [drachtio-fsrmf](https://www.npmjs.com/package/drachtio-fsmrf), you can access this API command via the api method on the 'endpoint' object.
 ```js
