@@ -724,7 +724,7 @@ static void *SWITCH_THREAD_FUNC grpc_read_thread(switch_thread_t *thread, void *
                         if (!page_disp.empty()) cJSON_AddItemToObject(j, "page_display_name", cJSON_CreateString(page_disp.c_str()));
                         // Include response parameters if any
                         if (qr.has_parameters()) {
-                            cJSON* jp = parser.parse(qr.parameters());
+                            cJSON* jp = parser.parseStruct(qr.parameters());
                             cJSON_AddItemToObject(j, "parameters", jp);
                         }
                         // Include request query_params (channel) if available
@@ -798,7 +798,7 @@ static void *SWITCH_THREAD_FUNC grpc_read_thread(switch_thread_t *thread, void *
                                 if (!page_disp.empty()) cJSON_AddItemToObject(j, "page_display_name", cJSON_CreateString(page_disp.c_str()));
                                 // Include response parameters if any (so listeners can see matched values)
                                 if (qr.has_parameters()) {
-                                    cJSON* jp = parser.parse(qr.parameters());
+                                    cJSON* jp = parser.parseStruct(qr.parameters());
                                     cJSON_AddItemToObject(j, "parameters", jp);
                                 }
                                 // Include request query_params (channel) if available

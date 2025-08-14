@@ -77,6 +77,10 @@ cJSON* GRPCParser::parse(const dfx::StreamingDetectIntentResponse& response) {
     return json;
 }
 
+cJSON* GRPCParser::parseStruct(const Struct& s) {
+    return parse(s);
+}
+
 cJSON* GRPCParser::parse(const Struct& s) {
     cJSON* obj = cJSON_CreateObject();
     for (const auto& it : s.fields()) {

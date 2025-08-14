@@ -14,6 +14,8 @@ public:
 
     cJSON* parse(const dfx::StreamingDetectIntentResponse& response);
     const std::string& parseAudio(const dfx::StreamingDetectIntentResponse& response);
+    // Expose a safe wrapper to serialize protobuf Structs to JSON
+    cJSON* parseStruct(const google::protobuf::Struct& s);
 
 private:
     // Helpers
@@ -24,4 +26,3 @@ private:
 };
 
 #endif
-
