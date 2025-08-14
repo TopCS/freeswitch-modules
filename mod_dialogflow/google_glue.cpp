@@ -668,6 +668,8 @@ static void *SWITCH_THREAD_FUNC grpc_read_thread(switch_thread_t *thread, void *
                 if (!allow_barge_in && will_autoplay && autoplay_sync && playAudio) {
                     // Pause streaming while we play the agent audio; we will resume afterwards
                     streamer->setPaused(true);
+                    switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(psession), SWITCH_LOG_DEBUG,
+                        "grpc_read_thread: pausing input during sync autoplay (barge-in disabled)\n");
                 } else {
                     // Arm next listening turn now; audio config will be sent on next frame
                     streamer->setNeedConfig();
@@ -711,8 +713,9 @@ static void *SWITCH_THREAD_FUNC grpc_read_thread(switch_thread_t *thread, void *
                     if (!end_page.empty() && Upage == toUpper(end_page)) end_match = true;
                     if (!end_match && have_intent && !end_intent.empty() && Udisp == toUpper(end_intent)) end_match = true;
                     if (end_match) {
-                        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(psession), SWITCH_LOG_INFO,
-                            "Dialogflow requested end of session (intent='%s' page='%s')\n", disp.c_str(), page_disp.c_str());
+                        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(psession), SWITCH_LOG_NOTICE,
+                            "DF END_SESSION match: intent='%s' page='%s' emit_only=%s\n",
+                            disp.c_str(), page_disp.c_str(), emit_only ? "true" : "false");
                         // Fire end_session event
                         cJSON* j = cJSON_CreateObject();
                         cJSON_AddItemToObject(j, "intent_display_name", cJSON_CreateString(disp.c_str()));
@@ -770,8 +773,8 @@ static void *SWITCH_THREAD_FUNC grpc_read_thread(switch_thread_t *thread, void *
 
                         if (!exten.empty()) {
                             switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(psession), SWITCH_LOG_NOTICE,
-                                "Dialogflow requested transfer to exten=%s dialplan=%s context=%s (intent='%s' page='%s')\n",
-                                exten.c_str(), dp.c_str(), ctx.c_str(), disp.c_str(), page_disp.c_str());
+                                "DF TRANSFER match: exten=%s dialplan=%s context=%s intent='%s' page='%s' emit_only=%s\n",
+                                exten.c_str(), dp.c_str(), ctx.c_str(), disp.c_str(), page_disp.c_str(), emit_only ? "true" : "false");
                             // Fire a transfer event with JSON body for external listeners
                             {
                                 cJSON* j = cJSON_CreateObject();
@@ -817,6 +820,13 @@ static void *SWITCH_THREAD_FUNC grpc_read_thread(switch_thread_t *thread, void *
 
             // save audio
             if (playAudio) {
+                // Do not attempt to play on a channel that is no longer ready
+                if (!switch_channel_ready(channel)) {
+                    switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(psession), SWITCH_LOG_WARNING,
+                        "Channel not ready during DF audio_provided; skipping playback and exiting read loop\n");
+                    switch_core_session_rwunlock(psession);
+                    return NULL;
+                }
 				std::ostringstream s;
 				s << SWITCH_GLOBAL_dirs.temp_dir << SWITCH_PATH_SEPARATOR <<
 					cb->sessionId << "_" <<  ++playCount;
