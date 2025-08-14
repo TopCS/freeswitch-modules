@@ -859,44 +859,40 @@ static void *SWITCH_THREAD_FUNC grpc_read_thread(switch_thread_t *thread, void *
 				if (will_autoplay && switch_channel_get_variable(channel, "DIALOGFLOW_AUTOPLAY_SYNC") == NULL) {
 					autoplay_sync = true; // default to sync to avoid no_input during long prompts
 				}
-				if (will_autoplay) {
-					if (autoplay_sync) {
-						// Play synchronously so we know when it finishes
-						switch_status_t st = switch_ivr_play_file(psession, NULL, s.str().c_str(), NULL);
-						switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(psession), SWITCH_LOG_INFO,
-							"Auto-playing Dialogflow audio synchronously: %s (status=%d)\n", s.str().c_str(), st);
-						// Resume streaming and arm next turn
-						switch_mutex_lock(cb->mutex);
-						streamer->setPaused(false);
-						streamer->setNeedConfig();
-						switch_mutex_unlock(cb->mutex);
-					} else {
-						// Fallback: async broadcast (legacy behavior)
-						char args[1024];
-						snprintf(args, sizeof(args), "%s %s aleg", cb->sessionId, s.str().c_str());
-						switch_stream_handle_t stream = { 0 };
-						SWITCH_STANDARD_STREAM(stream);
-						switch_status_t st = switch_api_execute("uuid_broadcast", args, NULL, &stream);
-						switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(psession), SWITCH_LOG_INFO,
-							"Auto-playing Dialogflow audio via uuid_broadcast: %s (status=%d)\n", args, st);
-						switch_safe_free(stream.data);
-						// If we had paused earlier (barge-in disabled), resume now even though playback is async
-						switch_mutex_lock(cb->mutex);
-						if (streamer->isPaused()) {
-							streamer->setPaused(false);
-							streamer->setNeedConfig();
-						}
-						switch_mutex_unlock(cb->mutex);
-					}
-				} else {
-					// Not auto-playing here. If we paused earlier, resume now to avoid stalling the session.
-					switch_mutex_lock(cb->mutex);
-					if (streamer->isPaused()) {
-						streamer->setPaused(false);
-						streamer->setNeedConfig();
-					}
-					switch_mutex_unlock(cb->mutex);
-				}
+                if (will_autoplay) {
+                    if (autoplay_sync) {
+                        // Play synchronously so we know when it finishes
+                        switch_status_t st = switch_ivr_play_file(psession, NULL, s.str().c_str(), NULL);
+                        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(psession), SWITCH_LOG_INFO,
+                            "Auto-playing Dialogflow audio synchronously: %s (status=%d)\n", s.str().c_str(), st);
+                        // Resume streaming and rotate to a fresh audio-configured stream for next user turn
+                        switch_mutex_lock(cb->mutex);
+                        streamer->setPaused(false);
+                        streamer->rotateToAudioConfig(psession);
+                        switch_mutex_unlock(cb->mutex);
+                    } else {
+                        // Fallback: async broadcast (legacy behavior)
+                        char args[1024];
+                        snprintf(args, sizeof(args), "%s %s aleg", cb->sessionId, s.str().c_str());
+                        switch_stream_handle_t stream = { 0 };
+                        SWITCH_STANDARD_STREAM(stream);
+                        switch_status_t st = switch_api_execute("uuid_broadcast", args, NULL, &stream);
+                        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(psession), SWITCH_LOG_INFO,
+                            "Auto-playing Dialogflow audio via uuid_broadcast: %s (status=%d)\n", args, st);
+                        switch_safe_free(stream.data);
+                        // Rotate immediately to begin listening during async playback
+                        switch_mutex_lock(cb->mutex);
+                        if (streamer->isPaused()) streamer->setPaused(false);
+                        streamer->rotateToAudioConfig(psession);
+                        switch_mutex_unlock(cb->mutex);
+                    }
+                } else {
+                    // Not auto-playing here. If we paused earlier, resume and rotate now.
+                    switch_mutex_lock(cb->mutex);
+                    if (streamer->isPaused()) streamer->setPaused(false);
+                    streamer->rotateToAudioConfig(psession);
+                    switch_mutex_unlock(cb->mutex);
+                }
 			}
 			switch_core_session_rwunlock(psession);
 		}
