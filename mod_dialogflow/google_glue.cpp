@@ -179,6 +179,7 @@ public:
             m_lang(lang), m_sessionId(switch_core_session_get_uuid(session)), m_environment("draft"), m_regionId("us"), m_agentId(""),
             m_speakingRate(), m_pitch(), m_volume(), m_voiceName(""), m_voiceGender(""), m_effects(""),
             m_sentimentAnalysis(false), m_finished(false), m_packets(0), m_needConfig(false),
+            m_paused(false),
             m_startedWithEvent(false), m_rotatedToAudio(false) {
 		const char* var;
 		switch_channel_t* channel = switch_core_session_get_channel(session);
@@ -450,6 +451,11 @@ public:
 			return false;
 		}
 
+        // If paused (e.g., while playing agent audio to caller), do not advance the turn
+        if (m_paused.load()) {
+            return true; // treat as success but skip sending to Dialogflow
+        }
+
         auto* qi = m_request->mutable_query_input();
         qi->clear_text();
         qi->clear_event();
@@ -498,6 +504,12 @@ public:
     void setNeedConfig() {
         m_needConfig.store(true);
     }
+
+    void setPaused(bool paused) {
+        m_paused.store(paused);
+    }
+
+    bool isPaused() const { return m_paused.load(); }
 
     void rotateToAudioConfig(switch_core_session_t* session) {
         switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO,
@@ -581,6 +593,7 @@ private:
     bool m_finished;
     uint32_t m_packets;
     std::atomic<bool> m_needConfig;
+    std::atomic<bool> m_paused;
     bool m_startedWithEvent;
     bool m_rotatedToAudio;
     std::string m_qpChannel;
@@ -644,10 +657,23 @@ static void *SWITCH_THREAD_FUNC grpc_read_thread(switch_thread_t *thread, void *
                 switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(psession), SWITCH_LOG_DEBUG,
                     "grpc_read_thread: detect_intent_response output_audio bytes=%zu config? %s\n",
                     audio.size(), dir.has_output_audio_config() ? "yes" : "no");
-                // Arm next listening turn now that agent responded
-                streamer->setNeedConfig();
-                switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(psession), SWITCH_LOG_DEBUG,
-                    "grpc_read_thread: arming next turn; will send new audio config on next frame\n");
+                // Decide if we should barge-in or block the next user turn during playback
+                bool allow_barge_in = switch_true(switch_channel_get_variable(channel, "DIALOGFLOW_BARGE_IN"));
+                bool will_autoplay = switch_true(switch_channel_get_variable(channel, "DIALOGFLOW_AUTOPLAY"));
+                bool autoplay_sync = switch_true(switch_channel_get_variable(channel, "DIALOGFLOW_AUTOPLAY_SYNC"));
+                // Default to sync when AUTOPLAY is requested unless explicitly disabled
+                if (will_autoplay && switch_channel_get_variable(channel, "DIALOGFLOW_AUTOPLAY_SYNC") == NULL) {
+                    autoplay_sync = true;
+                }
+                if (!allow_barge_in && will_autoplay && autoplay_sync && playAudio) {
+                    // Pause streaming while we play the agent audio; we will resume afterwards
+                    streamer->setPaused(true);
+                } else {
+                    // Arm next listening turn now; audio config will be sent on next frame
+                    streamer->setNeedConfig();
+                    switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(psession), SWITCH_LOG_DEBUG,
+                        "grpc_read_thread: arming next turn; will send new audio config on next frame\n");
+                }
 
                 // Handle auto actions: end-session / transfer-to-human based on intent name or parameters
                 const char* end_int_var = switch_channel_get_variable(channel, "DIALOGFLOW_END_SESSION_INTENT");
@@ -826,23 +852,50 @@ static void *SWITCH_THREAD_FUNC grpc_read_thread(switch_thread_t *thread, void *
 				free(json);
 				cJSON_Delete(jResponse);
 
-				// Rotate to a fresh audio-configured stream for the next user turn
-				// synchronize with writer
-				switch_mutex_lock(cb->mutex);
-				streamer->rotateToAudioConfig(psession);
-				switch_mutex_unlock(cb->mutex);
-
 				// Optional auto-play: play returned audio on the A leg when requested
 				const char* ap = switch_channel_get_variable(channel, "DIALOGFLOW_AUTOPLAY");
-				if (ap && switch_true(ap)) {
-					char args[1024];
-					snprintf(args, sizeof(args), "%s %s aleg", cb->sessionId, s.str().c_str());
-					switch_stream_handle_t stream = { 0 };
-					SWITCH_STANDARD_STREAM(stream);
-					switch_status_t st = switch_api_execute("uuid_broadcast", args, NULL, &stream);
-					switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(psession), SWITCH_LOG_INFO,
-						"Auto-playing Dialogflow audio via uuid_broadcast: %s (status=%d)\n", args, st);
-					switch_safe_free(stream.data);
+				bool will_autoplay = ap && switch_true(ap);
+				bool autoplay_sync = switch_true(switch_channel_get_variable(channel, "DIALOGFLOW_AUTOPLAY_SYNC"));
+				if (will_autoplay && switch_channel_get_variable(channel, "DIALOGFLOW_AUTOPLAY_SYNC") == NULL) {
+					autoplay_sync = true; // default to sync to avoid no_input during long prompts
+				}
+				if (will_autoplay) {
+					if (autoplay_sync) {
+						// Play synchronously so we know when it finishes
+						switch_status_t st = switch_ivr_play_file(psession, NULL, s.str().c_str(), NULL);
+						switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(psession), SWITCH_LOG_INFO,
+							"Auto-playing Dialogflow audio synchronously: %s (status=%d)\n", s.str().c_str(), st);
+						// Resume streaming and arm next turn
+						switch_mutex_lock(cb->mutex);
+						streamer->setPaused(false);
+						streamer->setNeedConfig();
+						switch_mutex_unlock(cb->mutex);
+					} else {
+						// Fallback: async broadcast (legacy behavior)
+						char args[1024];
+						snprintf(args, sizeof(args), "%s %s aleg", cb->sessionId, s.str().c_str());
+						switch_stream_handle_t stream = { 0 };
+						SWITCH_STANDARD_STREAM(stream);
+						switch_status_t st = switch_api_execute("uuid_broadcast", args, NULL, &stream);
+						switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(psession), SWITCH_LOG_INFO,
+							"Auto-playing Dialogflow audio via uuid_broadcast: %s (status=%d)\n", args, st);
+						switch_safe_free(stream.data);
+						// If we had paused earlier (barge-in disabled), resume now even though playback is async
+						switch_mutex_lock(cb->mutex);
+						if (streamer->isPaused()) {
+							streamer->setPaused(false);
+							streamer->setNeedConfig();
+						}
+						switch_mutex_unlock(cb->mutex);
+					}
+				} else {
+					// Not auto-playing here. If we paused earlier, resume now to avoid stalling the session.
+					switch_mutex_lock(cb->mutex);
+					if (streamer->isPaused()) {
+						streamer->setPaused(false);
+						streamer->setNeedConfig();
+					}
+					switch_mutex_unlock(cb->mutex);
 				}
 			}
 			switch_core_session_rwunlock(psession);
