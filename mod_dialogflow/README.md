@@ -110,6 +110,29 @@ When using [drachtio-fsrmf](https://www.npmjs.com/package/drachtio-fsmrf), you c
 ```js
 ep.api('dialogflow_start', `${ep.uuid} my-agent-uuxr:production en-US welcome`); 
 ```
+
+### Quick Examples
+
+- Final-only transcripts, include request params in events, 8k WAV output, auto-play with sync, custom session id:
+```
+uuid_setvar <uuid> DIALOGFLOW_TRANSCRIPT_FINAL_ONLY true
+uuid_setvar <uuid> DIALOGFLOW_INCLUDE_QUERY_PARAMS true
+uuid_setvar <uuid> DIALOGFLOW_OUTPUT_SAMPLE_RATE 8000
+uuid_setvar <uuid> DIALOGFLOW_OUTPUT_ENCODING wav
+uuid_setvar <uuid> DIALOGFLOW_AUTOPLAY true
+uuid_setvar <uuid> DIALOGFLOW_AUTOPLAY_SYNC true
+uuid_setvar <uuid> DIALOGFLOW_SESSION_ID my-observable-session-123
+uuid_setvar <uuid> DIALOGFLOW_CHANNEL ivr
+uuid_setvar <uuid> DIALOGFLOW_PARAMS {"customer_id":"12345"}
+dialogflow_start <uuid> myproj:myagent:draft:eu-west1:::en-US-Neural2-C en-US initial-welcome
+```
+
+- Lean ESL event stream (throttle interim transcripts and suppress audio body, filter via headers):
+```
+uuid_setvar <uuid> DIALOGFLOW_TRANSCRIPT_THROTTLE_MS 500
+uuid_setvar <uuid> DIALOGFLOW_SUPPRESS_AUDIO_EVENT_BODY true
+dialogflow_start <uuid> myproj:myagent::us:::en-US-Neural2-C en-US
+```
 ## Examples
 [drachtio-dialogflow-phone-gateway](https://github.com/davehorton/drachtio-dialogflow-phone-gateway)
 
