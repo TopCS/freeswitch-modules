@@ -10,6 +10,19 @@
 #define DIALOGFLOW_INTENT "dialogflow_intent"
 #define DIALOGFLOW_INTENT_AUDIO_FILE "dialogflow_intent_audio_file"
 
+#ifndef MOD_DIALOGFLOW_VERSION
+#define MOD_DIALOGFLOW_VERSION "unknown"
+#endif
+#ifndef MOD_DIALOGFLOW_GIT_HASH
+#define MOD_DIALOGFLOW_GIT_HASH "unknown"
+#endif
+#ifndef MOD_DIALOGFLOW_BUILD_DATE
+#define MOD_DIALOGFLOW_BUILD_DATE "unknown"
+#endif
+#ifndef MOD_DIALOGFLOW_BUILD_TYPE
+#define MOD_DIALOGFLOW_BUILD_TYPE "unknown"
+#endif
+
 /* Prototypes */
 SWITCH_MODULE_SHUTDOWN_FUNCTION(mod_dialogflow_shutdown);
 SWITCH_MODULE_RUNTIME_FUNCTION(mod_dialogflow_runtime);
@@ -18,6 +31,16 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_dialogflow_load);
 SWITCH_MODULE_DEFINITION(mod_dialogflow, mod_dialogflow_load, mod_dialogflow_shutdown, NULL);
 
 static switch_status_t do_stop(switch_core_session_t *session);
+
+static const char* mod_dialogflow_version_str(void) {
+    return "mod_dialogflow/" MOD_DIALOGFLOW_VERSION " (git " MOD_DIALOGFLOW_GIT_HASH ", built " MOD_DIALOGFLOW_BUILD_DATE ", " MOD_DIALOGFLOW_BUILD_TYPE ")";
+}
+
+SWITCH_STANDARD_API(dialogflow_api_version_function)
+{
+    stream->write_function(stream, "%s\n", mod_dialogflow_version_str());
+    return SWITCH_STATUS_SUCCESS;
+}
 
 static void responseHandler(switch_core_session_t* session, const char * type, char * json) {
     switch_event_t *event;
@@ -250,7 +273,7 @@ static switch_bool_t g_reserved_end_session = SWITCH_FALSE;
 
 SWITCH_MODULE_LOAD_FUNCTION(mod_dialogflow_load)
 {
-	switch_api_interface_t *api_interface;
+    switch_api_interface_t *api_interface;
 
 	/* create/register custom event message types */
 	if (switch_event_reserve_subclass(DIALOGFLOW_EVENT_INTENT) != SWITCH_STATUS_SUCCESS) {
@@ -289,16 +312,17 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_dialogflow_load)
 	/* connect my internal structure to the blank pointer passed to me */
 	*module_interface = switch_loadable_module_create_module_interface(pool, modname);
 
-	switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "Google Dialogflow API loading..\n");
+    switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "Google Dialogflow API loading.. %s\n", mod_dialogflow_version_str());
 
   if (SWITCH_STATUS_FALSE == google_dialogflow_init()) {
 		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_CRIT, "Failed initializing google dialogflow interface\n");
 	}
 
-	switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "Google Dialogflow API successfully loaded\n");
+    switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "Google Dialogflow API successfully loaded: %s\n", mod_dialogflow_version_str());
 
-	SWITCH_ADD_API(api_interface, "dialogflow_start", "Start a google dialogflow", dialogflow_api_start_function, DIALOGFLOW_API_START_SYNTAX);
-	SWITCH_ADD_API(api_interface, "dialogflow_stop", "Terminate a google dialogflow", dialogflow_api_stop_function, DIALOGFLOW_API_STOP_SYNTAX);
+    SWITCH_ADD_API(api_interface, "dialogflow_start", "Start a google dialogflow", dialogflow_api_start_function, DIALOGFLOW_API_START_SYNTAX);
+    SWITCH_ADD_API(api_interface, "dialogflow_stop", "Terminate a google dialogflow", dialogflow_api_stop_function, DIALOGFLOW_API_STOP_SYNTAX);
+    SWITCH_ADD_API(api_interface, "dialogflow_version", "Show mod_dialogflow version", dialogflow_api_version_function, "");
 
 	switch_console_set_complete("add dialogflow_stop");
 	switch_console_set_complete("add dialogflow_start project lang");

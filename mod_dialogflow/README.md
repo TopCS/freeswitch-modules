@@ -53,6 +53,13 @@ dialogflow_stop <uuid>
 ```
 Stops dialogflow on the channel.
 
+#### dialogflow_version
+```
+dialogflow_version
+```
+Prints the module version, git hash, build date and build type, e.g.:
+`mod_dialogflow/1.0.0 (git a1b2c3d, built 2025-08-14T10:22:33Z, Release)`
+
 ### Events
 * `dialogflow::intent` - a dialogflow [intent](https://dialogflow.com/docs/intents) has been detected.
 * `dialogflow::transcription` - a transcription has been returned (suppressed if `DIALOGFLOW_TRANSCRIPT_FINAL_ONLY=true` and interim).

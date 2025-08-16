@@ -9,6 +9,18 @@ set(CMAKE_SHARED_LIBRARY_PREFIX "")
 option(ENABLE_LOCAL "Add /usr/local/freeswitch pkgconfig path" ON)
 set(GENS_DIR "" CACHE PATH "Path to generated Google APIs C++ sources root (contains google/...")
 
+# Embed build metadata (git hash, date)
+execute_process(
+  COMMAND git -C ${CMAKE_SOURCE_DIR} rev-parse --short HEAD
+  OUTPUT_VARIABLE GIT_HASH
+  OUTPUT_STRIP_TRAILING_WHITESPACE
+  ERROR_QUIET
+)
+if(NOT GIT_HASH)
+  set(GIT_HASH "unknown")
+endif()
+string(TIMESTAMP BUILD_DATE "%Y-%m-%dT%H:%M:%SZ" UTC)
+
 if(ENABLE_LOCAL)
   set(ENV{PKG_CONFIG_PATH} "/usr/local/freeswitch/lib/pkgconfig:$ENV{PKG_CONFIG_PATH}")
 endif()
@@ -46,6 +58,12 @@ add_library(mod_dialogflow SHARED
 )
 
 target_compile_definitions(mod_dialogflow PRIVATE NOMINMAX)
+target_compile_definitions(mod_dialogflow PRIVATE 
+  MOD_DIALOGFLOW_VERSION="${PROJECT_VERSION}"
+  MOD_DIALOGFLOW_GIT_HASH="${GIT_HASH}"
+  MOD_DIALOGFLOW_BUILD_DATE="${BUILD_DATE}"
+  MOD_DIALOGFLOW_BUILD_TYPE="$<CONFIG>"
+)
 target_include_directories(mod_dialogflow PRIVATE
   ${GENS_DIR}
 )
