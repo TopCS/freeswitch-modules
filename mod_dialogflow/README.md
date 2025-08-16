@@ -75,6 +75,11 @@ Stops dialogflow on the channel.
 
 - `DIALOGFLOW_SESSION_ID`: Optional string to override the Dialogflow session id used in the gRPC path. If unset, the FreeSWITCH call UUID is used.
 - `DIALOGFLOW_TRANSCRIPT_FINAL_ONLY`: When `true`, suppress interim `dialogflow::transcription` events and only emit final transcriptions and `dialogflow::end_of_utterance`.
+- `DIALOGFLOW_TRANSCRIPT_THROTTLE_MS`: Integer; when set and not using `FINAL_ONLY`, throttles interim transcription events to at most one every N milliseconds.
+
+- `DIALOGFLOW_OUTPUT_SAMPLE_RATE`: Integer (8000–48000). Overrides the output audio sample rate requested from Dialogflow and used in input configs. Defaults to the channel read rate.
+- `DIALOGFLOW_OUTPUT_ENCODING`: One of `wav|mp3|opus`. Requests the given output audio encoding (default `wav` i.e., LINEAR16).
+- `DIALOGFLOW_SUPPRESS_AUDIO_EVENT_BODY`: When `true`, `dialogflow::audio_provided` will not include a JSON body; the audio file path is provided in the `DF-Audio-Path` event header instead.
 
 - `DIALOGFLOW_PASS_ALL_CHANNEL_VARS`: When `true`, include all channel variables as string `QueryParameters.parameters`.
 - `DIALOGFLOW_VAR_PREFIXES`: Optional comma-separated allowlist of prefixes to include when above is enabled (e.g., `sip_,caller_,origination_`).
@@ -93,7 +98,7 @@ Notes:
 - Be cautious when enabling `DIALOGFLOW_PASS_ALL_CHANNEL_VARS`; prefer `DIALOGFLOW_VAR_PREFIXES` to limit sensitive data exposure.
 
 All module events also include the following headers for quick filtering without parsing JSON:
-- `DF-Session-Path`, `DF-Session-Id`, `DF-Project`, `DF-Agent`, `DF-Region`, `DF-Environment`, `DF-Channel` (when set).
+- `DF-Session-Path`, `DF-Session-Id`, `DF-Project`, `DF-Agent`, `DF-Region`, `DF-Environment`, `DF-Channel` (when set), `DF-Response-Id`, `DF-Intent`, `DF-Page`, and for audio `DF-Audio-Path` (when body suppressed).
 
 ### Turn Timing During Playback
 By default, when `DIALOGFLOW_AUTOPLAY` is enabled the module now avoids opening a new Dialogflow turn until the returned agent audio has finished playing. This prevents spurious `no_input` while the caller is listening to long prompts.
