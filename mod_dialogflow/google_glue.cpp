@@ -188,13 +188,23 @@ void tokenize(std::string const &str, const char delim, std::vector<std::string>
 class GStreamer {
 public:
     GStreamer(switch_core_session_t *session, const char* lang, char* projectId, char* event, char* text) :
-            m_lang(lang), m_sessionId(switch_core_session_get_uuid(session)), m_environment("draft"), m_regionId("us"), m_agentId(""),
+            m_lang(lang), m_sessionId(), m_environment("draft"), m_regionId("us"), m_agentId(""),
             m_speakingRate(), m_pitch(), m_volume(), m_voiceName(""), m_voiceGender(""), m_effects(""),
             m_sentimentAnalysis(false), m_finished(false), m_packets(0), m_needConfig(false),
             m_paused(false),
             m_startedWithEvent(false), m_rotatedToAudio(false) {
 		const char* var;
 		switch_channel_t* channel = switch_core_session_get_channel(session);
+
+        // Allow overriding the Dialogflow session id via channel var
+        const char* sid = switch_channel_get_variable(channel, "DIALOGFLOW_SESSION_ID");
+        if (sid && *sid) {
+            m_sessionId.assign(sid);
+            switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO,
+                "GStreamer: using provided Dialogflow session id '%s'\n", m_sessionId.c_str());
+        } else {
+            m_sessionId.assign(switch_core_session_get_uuid(session));
+        }
 		std::vector<std::string> tokens;
 		const char delim = ':';
 		tokenize(projectId, delim, tokens);
@@ -534,6 +544,7 @@ public:
 
     const std::string& qpChannel() const { return m_qpChannel; }
     const std::string& requestParamsJSON() const { return m_requestParamsJSON; }
+    const std::string& sessionId() const { return m_sessionId; }
 
     void rotateToAudioConfig(switch_core_session_t* session) {
         switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO,

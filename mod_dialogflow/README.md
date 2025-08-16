@@ -73,6 +73,8 @@ Stops dialogflow on the channel.
   - `channel`: the request-side `QueryParameters.channel` if set (via `DIALOGFLOW_CHANNEL` or JSON `channel`).
   - `payload`: the exact JSON provided in `DIALOGFLOW_PARAMS` (echoed as an object when valid, otherwise omitted).
 
+- `DIALOGFLOW_SESSION_ID`: Optional string to override the Dialogflow session id used in the gRPC path. If unset, the FreeSWITCH call UUID is used.
+
 - `DIALOGFLOW_PASS_ALL_CHANNEL_VARS`: When `true`, include all channel variables as string `QueryParameters.parameters`.
 - `DIALOGFLOW_VAR_PREFIXES`: Optional comma-separated allowlist of prefixes to include when above is enabled (e.g., `sip_,caller_,origination_`).
 
