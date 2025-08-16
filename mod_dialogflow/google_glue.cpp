@@ -277,7 +277,8 @@ public:
 	}
 
     void startStream(switch_core_session_t *session, const char* event, const char* text) {
-		char szSession[256];
+        char szSession[256];
+        switch_channel_t* channel = switch_core_session_get_channel(session);
 
 		m_request = std::make_shared<StreamingDetectIntentRequest>();
 		m_context= std::make_shared<grpc::ClientContext>();
@@ -303,7 +304,6 @@ public:
 
         m_request->set_session(szSession);
         auto* queryInput = m_request->mutable_query_input();
-        switch_channel_t* channel = switch_core_session_get_channel(session);
         if (event) {
             auto* eventInput = queryInput->mutable_event();
             eventInput->set_event(event);
@@ -562,6 +562,7 @@ public:
     void rotateToAudioConfig(switch_core_session_t* session) {
         switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO,
             "GStreamer: rotating stream to audio mode for next user turn\n");
+        switch_channel_t* channel = switch_core_session_get_channel(session);
         // Gracefully finish current stream
         try { m_streamer->WritesDone(); } catch (...) {}
         try { m_streamer->Finish(); } catch (...) {}
@@ -611,6 +612,8 @@ public:
         auto* qp = m_request->mutable_query_params();
         if (!m_qpChannel.empty()) {
             qp->set_channel(m_qpChannel);
+            // keep header var in sync
+            switch_channel_set_variable(channel, "DF_CHANNEL", m_qpChannel.c_str());
         }
         if (m_sentimentAnalysis) qp->set_analyze_query_text_sentiment(true);
 
