@@ -187,12 +187,12 @@ void tokenize(std::string const &str, const char delim, std::vector<std::string>
 
 class GStreamer {
 public:
-    GStreamer(switch_core_session_t *session, const char* lang, char* projectId, char* event, char* text) :
+    GStreamer(switch_core_session_t *session, const char* lang, char* projectId, char* event, char* text, uint32_t sampleRate) :
             m_lang(lang), m_sessionId(), m_environment("draft"), m_regionId("us"), m_agentId(""),
             m_speakingRate(), m_pitch(), m_volume(), m_voiceName(""), m_voiceGender(""), m_effects(""),
             m_sentimentAnalysis(false), m_finished(false), m_packets(0), m_needConfig(false),
             m_paused(false),
-            m_startedWithEvent(false), m_rotatedToAudio(false) {
+            m_startedWithEvent(false), m_rotatedToAudio(false), m_sampleRate(sampleRate), m_outputEncoding(OutputAudioEncoding::OUTPUT_AUDIO_ENCODING_LINEAR_16) {
 		const char* var;
 		switch_channel_t* channel = switch_core_session_get_channel(session);
 
@@ -240,6 +240,18 @@ public:
         switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO, 
             "GStreamer dialogflow CX endpoint is %s, region is %s, project is %s, agent is %s, environment is %s\n", 
             endpoint.c_str(), m_regionId.c_str(), m_projectId.c_str(), m_agentId.c_str(), m_environment.c_str());        
+
+        // Allow overriding output sample rate and encoding via channel vars
+        if ((var = switch_channel_get_variable(channel, "DIALOGFLOW_OUTPUT_SAMPLE_RATE"))) {
+            int v = atoi(var);
+            if (v >= 8000 && v <= 48000) m_sampleRate = v;
+        }
+        if ((var = switch_channel_get_variable(channel, "DIALOGFLOW_OUTPUT_ENCODING"))) {
+            std::string enc = var; for (auto& c : enc) c = tolower(c);
+            if (enc == "mp3") m_outputEncoding = OutputAudioEncoding::OUTPUT_AUDIO_ENCODING_MP3;
+            else if (enc == "opus" || enc == "ogg" || enc == "ogg_opus") m_outputEncoding = OutputAudioEncoding::OUTPUT_AUDIO_ENCODING_OGG_OPUS;
+            else m_outputEncoding = OutputAudioEncoding::OUTPUT_AUDIO_ENCODING_LINEAR_16;
+        }
 
 		if ((var = switch_channel_get_variable(channel, "GOOGLE_APPLICATION_CREDENTIALS"))) {
 			std::string input = var;
@@ -456,8 +468,8 @@ public:
         switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "GStreamer::startStream requesting OutputAudio in LINEAR16 @16000Hz; custom params? %s\n",
                           isAnyOutputAudioConfigChanged() ? "yes" : "no");
         auto* outputAudioConfig = m_request->mutable_output_audio_config();
-        outputAudioConfig->set_sample_rate_hertz(16000);
-        outputAudioConfig->set_audio_encoding(OutputAudioEncoding::OUTPUT_AUDIO_ENCODING_LINEAR_16);
+        outputAudioConfig->set_sample_rate_hertz((int)m_sampleRate);
+        outputAudioConfig->set_audio_encoding(m_outputEncoding);
 
         if (isAnyOutputAudioConfigChanged()) {
             auto* synthesizeSpeechConfig = outputAudioConfig->mutable_synthesize_speech_config();
@@ -508,7 +520,7 @@ public:
         bool sendConfig = m_needConfig.exchange(false);
         if (sendConfig) {
             auto* audio_config = ai->mutable_config();
-            audio_config->set_sample_rate_hertz(16000);
+            audio_config->set_sample_rate_hertz((int)m_sampleRate);
             audio_config->set_audio_encoding(AudioEncoding::AUDIO_ENCODING_LINEAR_16);
             audio_config->set_single_utterance(true);
             switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "GStreamer::write sent new audio config to start next turn\n");
@@ -533,13 +545,19 @@ public:
 		m_finished = true;
 		return m_streamer->Finish();
 	}
-	void writesDone() {
-		m_streamer->WritesDone();
-	}
+    void writesDone() {
+        m_streamer->WritesDone();
+    }
 
-	bool isFinished() {
-		return m_finished;
-	}
+    bool isFinished() {
+        return m_finished;
+    }
+
+    void cancel() {
+        if (m_context) m_context->TryCancel();
+    }
+
+    bool isStopping() const { return m_finished; }
 
     bool isAnyOutputAudioConfigChanged() {
         return m_speakingRate|| m_pitch || m_volume || !m_voiceName.empty() || !m_voiceGender.empty() || !m_effects.empty();
@@ -578,16 +596,16 @@ public:
 
         auto* qi = m_request->mutable_query_input();
         auto* audio_input = qi->mutable_audio();
-        auto* audio_config = audio_input->mutable_config();
-        audio_config->set_sample_rate_hertz(16000);
-        audio_config->set_audio_encoding(AudioEncoding::AUDIO_ENCODING_LINEAR_16);
-        audio_config->set_single_utterance(true);
+            auto* audio_config = audio_input->mutable_config();
+            audio_config->set_sample_rate_hertz((int)m_sampleRate);
+            audio_config->set_audio_encoding(AudioEncoding::AUDIO_ENCODING_LINEAR_16);
+            audio_config->set_single_utterance(true);
         qi->set_language_code(m_lang.c_str());
 
         // Always request output audio
         auto* outputAudioConfig = m_request->mutable_output_audio_config();
-        outputAudioConfig->set_sample_rate_hertz(16000);
-        outputAudioConfig->set_audio_encoding(OutputAudioEncoding::OUTPUT_AUDIO_ENCODING_LINEAR_16);
+        outputAudioConfig->set_sample_rate_hertz((int)m_sampleRate);
+        outputAudioConfig->set_audio_encoding(m_outputEncoding);
         if (isAnyOutputAudioConfigChanged()) {
             auto* synthesizeSpeechConfig = outputAudioConfig->mutable_synthesize_speech_config();
             if (m_speakingRate) synthesizeSpeechConfig->set_speaking_rate(m_speakingRate);
@@ -651,6 +669,8 @@ private:
     bool m_startedWithEvent;
     bool m_rotatedToAudio;
     std::string m_qpChannel;
+    uint32_t m_sampleRate;
+    OutputAudioEncoding m_outputEncoding;
     std::string m_requestParamsJSON;
 };
 
@@ -707,6 +727,25 @@ static void *SWITCH_THREAD_FUNC grpc_read_thread(switch_thread_t *thread, void *
                 }
 
                 if (!suppress) {
+                    // Optional throttle for interim transcripts
+                    if (type == DIALOGFLOW_EVENT_TRANSCRIPTION) {
+                        bool final_only = switch_true(switch_channel_get_variable(channel, "DIALOGFLOW_TRANSCRIPT_FINAL_ONLY"));
+                        if (!final_only) {
+                            const char* th = switch_channel_get_variable(channel, "DIALOGFLOW_TRANSCRIPT_THROTTLE_MS");
+                            int throttle = th ? atoi(th) : 0;
+                            if (throttle > 0 && response.has_recognition_result()) {
+                                const auto& rr = response.recognition_result();
+                                if (!rr.is_final()) {
+                                    uint64_t now_ms = switch_micro_time_now() / 1000;
+                                    if (cb->lastTranscriptMs && (now_ms - cb->lastTranscriptMs < (uint64_t)throttle)) {
+                                        // skip this interim due to throttle
+                                        continue;
+                                    }
+                                    cb->lastTranscriptMs = now_ms;
+                                }
+                            }
+                        }
+                    }
                     cJSON* jResponse = parser.parse(response);
                     // Optionally include request query_params on all DF events
                     bool include_qp = switch_true(switch_channel_get_variable(channel, "DIALOGFLOW_INCLUDE_QUERY_PARAMS"));
@@ -733,6 +772,8 @@ static void *SWITCH_THREAD_FUNC grpc_read_thread(switch_thread_t *thread, void *
 			bool playAudio = !audio.empty() ;
             if (response.has_detect_intent_response()) {
                 const auto& dir = response.detect_intent_response();
+                // Set response headers (via channel vars consumed by responseHandler)
+                switch_channel_set_variable(channel, "DF_RESPONSE_ID", dir.response_id().c_str());
                 switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(psession), SWITCH_LOG_DEBUG,
                     "grpc_read_thread: detect_intent_response output_audio bytes=%zu config? %s\n",
                     audio.size(), dir.has_output_audio_config() ? "yes" : "no");
@@ -780,11 +821,13 @@ static void *SWITCH_THREAD_FUNC grpc_read_thread(switch_thread_t *thread, void *
                         disp = qr.intent().display_name();
                         have_intent = true;
                     }
+                    if (!disp.empty()) switch_channel_set_variable(channel, "DF_INTENT", disp.c_str());
                     std::string Udisp = toUpper(disp);
                     std::string page_disp;
                     if (qr.has_current_page()) {
                         page_disp = qr.current_page().display_name();
                     }
+                    if (!page_disp.empty()) switch_channel_set_variable(channel, "DF_PAGE", page_disp.c_str());
                     std::string Upage = toUpper(page_disp);
                     bool acted = false;
                     // End session: match by page display name (if provided) or intent display name
@@ -971,13 +1014,21 @@ static void *SWITCH_THREAD_FUNC grpc_read_thread(switch_thread_t *thread, void *
 				// we'll delete when session closes
 				audioFiles.insert(std::pair<std::string, std::string>(cb->sessionId, s.str()));
 
-				cJSON * jResponse = cJSON_CreateObject();
-				cJSON_AddItemToObject(jResponse, "path", cJSON_CreateString(s.str().c_str()));
-				char* json = cJSON_PrintUnformatted(jResponse);
-
-				cb->responseHandler(psession, DIALOGFLOW_EVENT_AUDIO_PROVIDED, json);
-				free(json);
-				cJSON_Delete(jResponse);
+                bool suppress_audio_body = switch_true(switch_channel_get_variable(channel, "DIALOGFLOW_SUPPRESS_AUDIO_EVENT_BODY"));
+                if (suppress_audio_body) {
+                    // Put path into header via channel var, send empty JSON {}
+                    switch_channel_set_variable(channel, "DF_AUDIO_PATH", s.str().c_str());
+                    char* json = strdup("{}");
+                    cb->responseHandler(psession, DIALOGFLOW_EVENT_AUDIO_PROVIDED, json);
+                    free(json);
+                } else {
+                    cJSON * jResponse = cJSON_CreateObject();
+                    cJSON_AddItemToObject(jResponse, "path", cJSON_CreateString(s.str().c_str()));
+                    char* json = cJSON_PrintUnformatted(jResponse);
+                    cb->responseHandler(psession, DIALOGFLOW_EVENT_AUDIO_PROVIDED, json);
+                    free(json);
+                    cJSON_Delete(jResponse);
+                }
 
 				// Optional auto-play: play returned audio on the A leg when requested
 				const char* ap = switch_channel_get_variable(channel, "DIALOGFLOW_AUTOPLAY");
@@ -1032,10 +1083,25 @@ static void *SWITCH_THREAD_FUNC grpc_read_thread(switch_thread_t *thread, void *
 	// finish the detect intent session: here is where we may get an error if credentials are invalid
 	switch_core_session_t* psession = switch_core_session_locate(cb->sessionId);
 	if (psession) {
-		grpc::Status status = streamer->finish();
+	grpc::Status status = streamer->finish();
 		if (!status.ok()) {
 			std::ostringstream s;
 			s << "{\"msg\": \"" << status.error_message() << "\", \"code\": " << status.error_code();
+			// Categorize and mark retryable
+			const int ec = status.error_code();
+			const char* category = "unknown";
+			bool retryable = false;
+			switch (ec) {
+				case grpc::StatusCode::UNAUTHENTICATED:
+				case grpc::StatusCode::PERMISSION_DENIED: category = "auth"; break;
+				case grpc::StatusCode::RESOURCE_EXHAUSTED: category = "quota"; break;
+				case grpc::StatusCode::UNAVAILABLE: category = "network"; retryable = true; break;
+				case grpc::StatusCode::DEADLINE_EXCEEDED: category = "timeout"; retryable = true; break;
+				case grpc::StatusCode::INTERNAL: category = "server"; retryable = true; break;
+				default: break;
+			}
+			s << ", \"category\": \"" << category << "\"";
+			s << ", \"retryable\": " << (retryable ? "true" : "false");
 			if (status.error_details().length() > 0) {
 				s << ", \"details\": \"" << status.error_details() << "\"";
 			}
@@ -1108,7 +1174,7 @@ extern "C" {
         strncpy(cb->lang, lang, MAX_LANG);
         strncpy(cb->projectId, projectId, MAX_PROJECT_ID);
         try {
-            cb->streamer = new GStreamer(session, lang, projectId, event, text);
+            cb->streamer = new GStreamer(session, lang, projectId, event, text, samples_per_second);
         } catch (const std::exception& e) {
             switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_CRIT, "GStreamer construction failed: %s\n", e.what());
             status = SWITCH_STATUS_FALSE;
@@ -1142,7 +1208,10 @@ extern "C" {
 		// hangup hook to clear temp audio files
 		switch_core_event_hook_add_state_change(session, hanguphook);
 
-		// create the read thread
+        // init throttling
+        cb->lastTranscriptMs = 0;
+
+        // create the read thread
 		switch_threadattr_create(&thd_attr, pool);
 		//switch_threadattr_detach_set(thd_attr, 1);
 		switch_threadattr_stacksize_set(thd_attr, SWITCH_THREAD_STACKSIZE);
@@ -1171,6 +1240,8 @@ extern "C" {
 			switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "google_dialogflow_session_cleanup: acquired lock\n");
 			GStreamer* streamer = (GStreamer *) cb->streamer;
 			if (streamer) {
+				// Cancel any in-flight stream to break out of read loop quickly
+				streamer->cancel();
 				switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "google_dialogflow_session_cleanup: sending writesDone..\n");
 				streamer->writesDone();
 				streamer->finish();
