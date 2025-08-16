@@ -55,7 +55,7 @@ Stops dialogflow on the channel.
 
 ### Events
 * `dialogflow::intent` - a dialogflow [intent](https://dialogflow.com/docs/intents) has been detected.
-* `dialogflow::transcription` - a transcription has been returned
+* `dialogflow::transcription` - a transcription has been returned (suppressed if `DIALOGFLOW_TRANSCRIPT_FINAL_ONLY=true` and interim).
 * `dialogflow::audio_provided` - an audio prompt has been returned from Dialogflow. The module writes the audio to a temporary file and fires this event with JSON `{ "path": "/tmp/....wav|.mp3|.opus" }`. Playback is not automatic unless `DIALOGFLOW_AUTOPLAY` is enabled.
 * `dialogflow::end_of_utterance` - dialogflow has detected the end of an utterance
 * `dialogflow::error` - dialogflow has returned an error
@@ -74,6 +74,7 @@ Stops dialogflow on the channel.
   - `payload`: the exact JSON provided in `DIALOGFLOW_PARAMS` (echoed as an object when valid, otherwise omitted).
 
 - `DIALOGFLOW_SESSION_ID`: Optional string to override the Dialogflow session id used in the gRPC path. If unset, the FreeSWITCH call UUID is used.
+- `DIALOGFLOW_TRANSCRIPT_FINAL_ONLY`: When `true`, suppress interim `dialogflow::transcription` events and only emit final transcriptions and `dialogflow::end_of_utterance`.
 
 - `DIALOGFLOW_PASS_ALL_CHANNEL_VARS`: When `true`, include all channel variables as string `QueryParameters.parameters`.
 - `DIALOGFLOW_VAR_PREFIXES`: Optional comma-separated allowlist of prefixes to include when above is enabled (e.g., `sip_,caller_,origination_`).
@@ -90,6 +91,9 @@ Stops dialogflow on the channel.
 Notes:
 - Transfer intent also honors DF parameters if present: `transfer_to`/`transfer_target`/`destination`/`exten`, plus optional `context` and `dialplan`.
 - Be cautious when enabling `DIALOGFLOW_PASS_ALL_CHANNEL_VARS`; prefer `DIALOGFLOW_VAR_PREFIXES` to limit sensitive data exposure.
+
+All module events also include the following headers for quick filtering without parsing JSON:
+- `DF-Session-Path`, `DF-Session-Id`, `DF-Project`, `DF-Agent`, `DF-Region`, `DF-Environment`, `DF-Channel` (when set).
 
 ### Turn Timing During Playback
 By default, when `DIALOGFLOW_AUTOPLAY` is enabled the module now avoids opening a new Dialogflow turn until the returned agent audio has finished playing. This prevents spurious `no_input` while the caller is listening to long prompts.
