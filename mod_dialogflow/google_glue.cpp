@@ -286,7 +286,12 @@ public:
         snprintf(szSession, 256, "projects/%s/locations/%s/agents/%s/sessions/%s", 
                     m_projectId.c_str(), m_regionId.c_str(), m_agentId.c_str(), m_sessionId.c_str());
 
-		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO, "GStreamer::startStream session %s, event %s, text %s %p\n", szSession, event, text, this);
+        // Sanity log: print the composed CX session path once per call for observability
+        switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE,
+            "Dialogflow CX session path: %s (project=%s agent=%s region=%s env=%s session_id=%s)\n",
+            szSession, m_projectId.c_str(), m_agentId.c_str(), m_regionId.c_str(), m_environment.c_str(), m_sessionId.c_str());
+
+        switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO, "GStreamer::startStream session %s, event %s, text %s %p\n", szSession, event, text, this);
 
         m_request->set_session(szSession);
         auto* queryInput = m_request->mutable_query_input();
