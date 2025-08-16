@@ -293,6 +293,14 @@ public:
 
         switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO, "GStreamer::startStream session %s, event %s, text %s %p\n", szSession, event, text, this);
 
+        // Expose DF metadata as channel vars for event headers
+        switch_channel_set_variable(channel, "DF_SESSION_PATH", szSession);
+        switch_channel_set_variable(channel, "DF_SESSION_ID", m_sessionId.c_str());
+        switch_channel_set_variable(channel, "DF_PROJECT", m_projectId.c_str());
+        if (!m_agentId.empty()) switch_channel_set_variable(channel, "DF_AGENT", m_agentId.c_str());
+        switch_channel_set_variable(channel, "DF_REGION", m_regionId.c_str());
+        switch_channel_set_variable(channel, "DF_ENVIRONMENT", m_environment.c_str());
+
         m_request->set_session(szSession);
         auto* queryInput = m_request->mutable_query_input();
         switch_channel_t* channel = switch_core_session_get_channel(session);
@@ -606,6 +614,9 @@ public:
         }
         if (m_sentimentAnalysis) qp->set_analyze_query_text_sentiment(true);
 
+        // Also expose the logical channel as a channel var for headers, if present
+        if (!m_qpChannel.empty()) switch_channel_set_variable(channel, "DF_CHANNEL", m_qpChannel.c_str());
+
         m_streamer = m_stub->StreamingDetectIntent(m_context.get());
         m_streamer->Write(*m_request);
         // Subsequent writes will send only audio bytes
@@ -670,40 +681,50 @@ static void *SWITCH_THREAD_FUNC grpc_read_thread(switch_thread_t *thread, void *
 			switch_channel_t* channel = switch_core_session_get_channel(psession);
 			GRPCParser parser(psession);
 
-				if (response.has_detect_intent_response() || response.has_recognition_result()) {
-					cJSON* jResponse = parser.parse(response) ;
-					// Optionally include request query_params on all DF events
-					bool include_qp = switch_true(switch_channel_get_variable(channel, "DIALOGFLOW_INCLUDE_QUERY_PARAMS"));
-					if (include_qp) {
-						cJSON* jq = cJSON_CreateObject();
-						if (!streamer->qpChannel().empty()) {
-							cJSON_AddItemToObject(jq, "channel", cJSON_CreateString(streamer->qpChannel().c_str()));
-						}
-						if (!streamer->requestParamsJSON().empty()) {
-							cJSON* pl = cJSON_Parse(streamer->requestParamsJSON().c_str());
-							if (pl) cJSON_AddItemToObject(jq, "payload", pl);
-							else cJSON_AddItemToObject(jq, "payload", cJSON_CreateString(streamer->requestParamsJSON().c_str()));
-						}
-						cJSON_AddItemToObject(jResponse, "query_params", jq);
-					}
-					char* json = cJSON_PrintUnformatted(jResponse);
-					const char* type = DIALOGFLOW_EVENT_TRANSCRIPTION;
-
-				if (response.has_detect_intent_response()) type = DIALOGFLOW_EVENT_INTENT;
-				else {
-					auto o = response.recognition_result().message_type();
-                    if (0 == StreamingRecognitionResult::MessageType_Name(o).compare("END_OF_SINGLE_UTTERANCE")) {
+            if (response.has_detect_intent_response() || response.has_recognition_result()) {
+                // Determine event type and whether to suppress interim transcripts
+                const char* type = DIALOGFLOW_EVENT_TRANSCRIPTION;
+                bool suppress = false;
+                if (response.has_detect_intent_response()) {
+                    type = DIALOGFLOW_EVENT_INTENT;
+                } else if (response.has_recognition_result()) {
+                    const auto& rr = response.recognition_result();
+                    auto o = rr.message_type();
+                    bool is_eou = (0 == StreamingRecognitionResult::MessageType_Name(o).compare("END_OF_SINGLE_UTTERANCE"));
+                    if (is_eou) {
                         type = DIALOGFLOW_EVENT_END_OF_UTTERANCE;
                         switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(psession), SWITCH_LOG_DEBUG,
                             "grpc_read_thread: END_OF_SINGLE_UTTERANCE received\n");
+                    } else {
+                        bool final_only = switch_true(switch_channel_get_variable(channel, "DIALOGFLOW_TRANSCRIPT_FINAL_ONLY"));
+                        if (final_only && !rr.is_final()) {
+                            suppress = true; // skip interim transcripts
+                        }
                     }
-				}
+                }
 
-				cb->responseHandler(psession, type, json);
-
-				free(json);
-				cJSON_Delete(jResponse);
-			}
+                if (!suppress) {
+                    cJSON* jResponse = parser.parse(response);
+                    // Optionally include request query_params on all DF events
+                    bool include_qp = switch_true(switch_channel_get_variable(channel, "DIALOGFLOW_INCLUDE_QUERY_PARAMS"));
+                    if (include_qp) {
+                        cJSON* jq = cJSON_CreateObject();
+                        if (!streamer->qpChannel().empty()) {
+                            cJSON_AddItemToObject(jq, "channel", cJSON_CreateString(streamer->qpChannel().c_str()));
+                        }
+                        if (!streamer->requestParamsJSON().empty()) {
+                            cJSON* pl = cJSON_Parse(streamer->requestParamsJSON().c_str());
+                            if (pl) cJSON_AddItemToObject(jq, "payload", pl);
+                            else cJSON_AddItemToObject(jq, "payload", cJSON_CreateString(streamer->requestParamsJSON().c_str()));
+                        }
+                        cJSON_AddItemToObject(jResponse, "query_params", jq);
+                    }
+                    char* json = cJSON_PrintUnformatted(jResponse);
+                    cb->responseHandler(psession, type, json);
+                    free(json);
+                    cJSON_Delete(jResponse);
+                }
+            }
 
 			const std::string& audio = parser.parseAudio(response);
 			bool playAudio = !audio.empty() ;
