@@ -5,7 +5,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates wget git \
     build-essential cmake pkg-config \
-    libfreeswitch-dev libspeexdsp-dev \
+    libspeexdsp-dev \
     libgrpc++-dev protobuf-compiler-grpc libprotobuf-dev protobuf-compiler \
     zlib1g-dev libssl-dev \
     && rm -rf /var/lib/apt/lists/*
