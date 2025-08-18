@@ -19,8 +19,24 @@
 - Headers: declare public interfaces in `mod_dialogflow.h` / `google_glue.h`; keep module-local symbols `static`.
 
 ## Testing Guidelines
-- No unit test suite is present; prefer manual verification via `fs_cli` and event inspection (`dialogflow::intent`, `dialogflow::transcription`, `dialogflow::audio_provided`, `dialogflow::end_of_utterance`, `dialogflow::error`).
+- No unit test suite is present; prefer manual verification via `fs_cli` and event inspection (`dialogflow::intent`, `dialogflow::transcription`, `dialogflow::audio_provided`, `dialogflow::end_of_utterance`, `dialogflow::error`, `dialogflow::webhook_error`).
 - Add focused tests only if you introduce isolated helpers (e.g., parser functions), following nearby patterns.
+
+## Local Build & Install Cheat Sheet
+- Prereqs: `pkg-config`, CMake ≥ 3.18, C++17 toolchain, `grpc++`, `grpc`, `protobuf`, `speexdsp`, FreeSWITCH `freeswitch` pkg-config. Generated Google APIs C++ sources must be available under `GENS_DIR` (e.g., `/home/andrea-batazzi/dev/gens`).
+- Configure (standalone):
+  - `cmake -S . -B build -DGENS_DIR=/home/andrea-batazzi/dev/gens -DCMAKE_BUILD_TYPE=Release`
+- Build:
+  - `cmake --build build -j`
+- Install/copia modulo:
+  - Se `pkg-config --variable=modulesdir freeswitch` è configurato, puoi usare `cmake --install build`.
+  - In alternativa copia manualmente: `install -m 0755 build/mod_dialogflow.so /usr/local/freeswitch/mod/`
+- Carica/verifica in FreeSWITCH:
+  - `fs_cli -x 'load mod_dialogflow'`
+  - `fs_cli -x 'dialogflow_version'` oppure `fs_cli -x 'module_exists mod_dialogflow'`
+- Commit tipico:
+  - `git add <files>`
+  - `git commit -m "<area>: <breve descrizione>"`
 
 ## Commits & Pull Requests
 - Commits: small, focused, and descriptive (scope: area, e.g., "parser:"). Reference issues when available.
