@@ -61,12 +61,26 @@ target_compile_definitions(mod_dialogflow PRIVATE NOMINMAX)
 target_compile_definitions(mod_dialogflow PRIVATE 
   MOD_DIALOGFLOW_VERSION="${PROJECT_VERSION}"
   MOD_DIALOGFLOW_GIT_HASH="${GIT_HASH}"
-  MOD_DIALOGFLOW_BUILD_DATE="${BUILD_DATE}"
   MOD_DIALOGFLOW_BUILD_TYPE="$<CONFIG>"
 )
 target_include_directories(mod_dialogflow PRIVATE
   ${GENS_DIR}
 )
+
+# Make generated headers (build_info.h) visible
+target_include_directories(mod_dialogflow PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
+
+# Generate build_info.h at build time with a fresh timestamp (and git hash)
+add_custom_target(gen_build_info ALL
+  COMMAND ${CMAKE_COMMAND}
+          -DBUILD_INFO_OUT=${CMAKE_CURRENT_BINARY_DIR}/build_info.h
+          -DBUILD_TYPE=$<CONFIG>
+          -DSRC_DIR=${CMAKE_SOURCE_DIR}
+          -P ${CMAKE_SOURCE_DIR}/cmake/GenBuildInfo.cmake
+  BYPRODUCTS ${CMAKE_CURRENT_BINARY_DIR}/build_info.h
+  COMMENT "Generating build_info.h with current timestamp"
+)
+add_dependencies(mod_dialogflow gen_build_info)
 
 # Suppress deprecation warnings in generated sources
 foreach(src ${GENS_SOURCES})

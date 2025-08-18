@@ -5,6 +5,7 @@
  */
 #include "mod_dialogflow.h"
 #include "google_glue.h"
+#include "build_info.h"
 
 #define DEFAULT_INTENT_TIMEOUT_SECS (30)
 #define DIALOGFLOW_INTENT "dialogflow_intent"
