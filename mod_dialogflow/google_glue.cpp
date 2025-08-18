@@ -829,6 +829,77 @@ static void *SWITCH_THREAD_FUNC grpc_read_thread(switch_thread_t *thread, void *
                     }
                     if (!page_disp.empty()) switch_channel_set_variable(channel, "DF_PAGE", page_disp.c_str());
                     std::string Upage = toUpper(page_disp);
+
+                    // Optionally emit webhook error events based on QueryResult.webhook_statuses / diagnostic_info
+                    do {
+                        const char* emit_var = switch_channel_get_variable(channel, "DIALOGFLOW_EMIT_WEBHOOK_ERRORS");
+                        bool emit_webhook_errors = (emit_var == NULL) ? true : switch_true(emit_var);
+                        if (!emit_webhook_errors) break;
+
+                        // Helper: map google.rpc.Status.code to category/retryable
+                        auto categorize = [](int code, const char** cat, bool* retry) {
+                            const char* c = "unknown"; bool r = false;
+                            switch (code) {
+                                case 16: // UNAUTHENTICATED
+                                case 7:  // PERMISSION_DENIED
+                                    c = "auth"; r = false; break;
+                                case 8:  // RESOURCE_EXHAUSTED
+                                    c = "quota"; r = false; break;
+                                case 14: // UNAVAILABLE
+                                    c = "network"; r = true; break;
+                                case 4:  // DEADLINE_EXCEEDED
+                                    c = "timeout"; r = true; break;
+                                case 13: // INTERNAL
+                                    c = "server"; r = true; break;
+                                default:
+                                    c = "unknown"; r = false; break;
+                            }
+                            *cat = c; *retry = r;
+                        };
+
+                        // Emit one event per failing webhook status
+                        int ws_count = qr.webhook_statuses_size();
+                        for (int i = 0; i < ws_count; ++i) {
+                            const google::rpc::Status& st = qr.webhook_statuses(i);
+                            if (st.code() == 0) continue; // OK
+                            const char* cat; bool retry;
+                            categorize(st.code(), &cat, &retry);
+                            cJSON* j = cJSON_CreateObject();
+                            cJSON_AddItemToObject(j, "index", cJSON_CreateNumber(i));
+                            cJSON_AddItemToObject(j, "code", cJSON_CreateNumber(st.code()));
+                            cJSON_AddItemToObject(j, "message", cJSON_CreateString(st.message().c_str()));
+                            cJSON_AddItemToObject(j, "category", cJSON_CreateString(cat));
+                            cJSON_AddItemToObject(j, "retryable", cJSON_CreateBool(retry));
+                            // Include diagnostic_info when present
+                            if (qr.has_diagnostic_info()) {
+                                GRPCParser p(psession);
+                                cJSON* diag = p.parseStruct(qr.diagnostic_info());
+                                if (diag) cJSON_AddItemToObject(j, "diagnostic_info", diag);
+                            }
+                            // Include request query_params if requested
+                            bool include_qp3 = switch_true(switch_channel_get_variable(channel, "DIALOGFLOW_INCLUDE_QUERY_PARAMS"));
+                            if (include_qp3) {
+                                cJSON* jq = cJSON_CreateObject();
+                                if (!streamer->qpChannel().empty()) {
+                                    cJSON_AddItemToObject(jq, "channel", cJSON_CreateString(streamer->qpChannel().c_str()));
+                                }
+                                if (!streamer->requestParamsJSON().empty()) {
+                                    cJSON* pl = cJSON_Parse(streamer->requestParamsJSON().c_str());
+                                    if (pl) cJSON_AddItemToObject(jq, "payload", pl);
+                                    else cJSON_AddItemToObject(jq, "payload", cJSON_CreateString(streamer->requestParamsJSON().c_str()));
+                                }
+                                cJSON_AddItemToObject(j, "query_params", jq);
+                            }
+                            // Add context
+                            if (!disp.empty()) cJSON_AddItemToObject(j, "intent_display_name", cJSON_CreateString(disp.c_str()));
+                            if (!page_disp.empty()) cJSON_AddItemToObject(j, "page_display_name", cJSON_CreateString(page_disp.c_str()));
+                            char* body = cJSON_PrintUnformatted(j);
+                            cb->responseHandler(psession, DIALOGFLOW_EVENT_WEBHOOK_ERROR, body);
+                            free(body);
+                            cJSON_Delete(j);
+                        }
+                    } while (0);
+
                     bool acted = false;
                     // End session: match by page display name (if provided) or intent display name
                     bool end_match = false;

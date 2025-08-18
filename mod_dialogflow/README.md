@@ -66,6 +66,7 @@ Prints the module version, git hash, build date and build type, e.g.:
 * `dialogflow::audio_provided` - an audio prompt has been returned from Dialogflow. The module writes the audio to a temporary file and fires this event with JSON `{ "path": "/tmp/....wav|.mp3|.opus" }`. Playback is not automatic unless `DIALOGFLOW_AUTOPLAY` is enabled.
 * `dialogflow::end_of_utterance` - dialogflow has detected the end of an utterance
 * `dialogflow::error` - dialogflow has returned an error
+* `dialogflow::webhook_error` - one or more Dialogflow webhooks failed for the turn. Emitted once per failing webhook with JSON body including `index`, `code`, `message`, `category`, `retryable`, optional `diagnostic_info`, and when enabled `query_params`. The event does not stop the session by itself; decide in your app whether to retry/fallback.
 * `dialogflow::transfer` - module is about to transfer the call; JSON body includes `exten`, `context`, `dialplan`, `intent_display_name`. Also includes `parameters` (from Dialogflow QueryResult) and, when enabled, `query_params`.
 * `dialogflow::end_session` - module is about to end the session; JSON body includes `intent_display_name`. Also includes `parameters` (from Dialogflow QueryResult) and, when enabled, `query_params`.
 
@@ -87,6 +88,7 @@ Prints the module version, git hash, build date and build type, e.g.:
 - `DIALOGFLOW_OUTPUT_SAMPLE_RATE`: Integer (8000–48000). Overrides the output audio sample rate requested from Dialogflow and used in input configs. Defaults to the channel read rate.
 - `DIALOGFLOW_OUTPUT_ENCODING`: One of `wav|mp3|opus`. Requests the given output audio encoding (default `wav` i.e., LINEAR16).
 - `DIALOGFLOW_SUPPRESS_AUDIO_EVENT_BODY`: When `true`, `dialogflow::audio_provided` will not include a JSON body; the audio file path is provided in the `DF-Audio-Path` event header instead.
+ - `DIALOGFLOW_EMIT_WEBHOOK_ERRORS`: When `true` (default), emit `dialogflow::webhook_error` events when Dialogflow reports webhook failures in `QueryResult.webhook_statuses` (and attach `diagnostic_info` when available). Set to `false` to suppress.
 
 - `DIALOGFLOW_PASS_ALL_CHANNEL_VARS`: When `true`, include all channel variables as string `QueryParameters.parameters`.
 - `DIALOGFLOW_VAR_PREFIXES`: Optional comma-separated allowlist of prefixes to include when above is enabled (e.g., `sip_,caller_,origination_`).

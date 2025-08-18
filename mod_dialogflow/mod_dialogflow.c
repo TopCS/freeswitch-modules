@@ -270,6 +270,7 @@ static switch_bool_t g_reserved_audio = SWITCH_FALSE;
 static switch_bool_t g_reserved_error = SWITCH_FALSE;
 static switch_bool_t g_reserved_transfer = SWITCH_FALSE;
 static switch_bool_t g_reserved_end_session = SWITCH_FALSE;
+static switch_bool_t g_reserved_webhook_error = SWITCH_FALSE;
 
 SWITCH_MODULE_LOAD_FUNCTION(mod_dialogflow_load)
 {
@@ -297,6 +298,11 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_dialogflow_load)
 		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Couldn't register subclass %s!\n", DIALOGFLOW_EVENT_ERROR);
 		return SWITCH_STATUS_TERM;
 	} else g_reserved_error = SWITCH_TRUE;
+
+	if (switch_event_reserve_subclass(DIALOGFLOW_EVENT_WEBHOOK_ERROR) != SWITCH_STATUS_SUCCESS) {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Couldn't register subclass %s!\n", DIALOGFLOW_EVENT_WEBHOOK_ERROR);
+		return SWITCH_STATUS_TERM;
+	} else g_reserved_webhook_error = SWITCH_TRUE;
 
 	if (switch_event_reserve_subclass(DIALOGFLOW_EVENT_TRANSFER) != SWITCH_STATUS_SUCCESS) {
 		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Couldn't register subclass %s!\n", DIALOGFLOW_EVENT_TRANSFER);
@@ -347,6 +353,7 @@ SWITCH_MODULE_SHUTDOWN_FUNCTION(mod_dialogflow_shutdown)
 	if (g_reserved_error) { switch_event_free_subclass(DIALOGFLOW_EVENT_ERROR); g_reserved_error = SWITCH_FALSE; }
 	if (g_reserved_transfer) { switch_event_free_subclass(DIALOGFLOW_EVENT_TRANSFER); g_reserved_transfer = SWITCH_FALSE; }
 	if (g_reserved_end_session) { switch_event_free_subclass(DIALOGFLOW_EVENT_END_SESSION); g_reserved_end_session = SWITCH_FALSE; }
+    if (g_reserved_webhook_error) { switch_event_free_subclass(DIALOGFLOW_EVENT_WEBHOOK_ERROR); g_reserved_webhook_error = SWITCH_FALSE; }
 
 	return SWITCH_STATUS_SUCCESS;
 }

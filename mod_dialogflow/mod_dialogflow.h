@@ -14,6 +14,8 @@
 #define DIALOGFLOW_EVENT_ERROR "dialogflow::error"
 #define DIALOGFLOW_EVENT_TRANSFER "dialogflow::transfer"
 #define DIALOGFLOW_EVENT_END_SESSION "dialogflow::end_session"
+// Emitted when Dialogflow CX reports webhook failures inside QueryResult
+#define DIALOGFLOW_EVENT_WEBHOOK_ERROR "dialogflow::webhook_error"
 
 #define MAX_LANG (12)
 #define MAX_PROJECT_ID (128)
