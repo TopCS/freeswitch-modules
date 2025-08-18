@@ -321,6 +321,8 @@ public:
             eventInput->set_event(event);
             queryInput->set_language_code(m_lang.c_str());
             m_startedWithEvent = true;
+            // Mark start of an event-driven turn
+            markTurnStart();
             // Merge optional parameters: 5th arg JSON, DIALOGFLOW_CHANNEL, DIALOGFLOW_PARAMS, optional channel vars
             cJSON* root = cJSON_CreateObject();
             bool have_params = false;
@@ -406,6 +408,8 @@ public:
                     audio_config->set_sample_rate_hertz(16000);
                     audio_config->set_audio_encoding(AudioEncoding::AUDIO_ENCODING_LINEAR_16);
                     audio_config->set_single_utterance(true);
+                    // Mark start of a text+audio turn (we'll send audio next)
+                    markTurnStart();
                     queryInput->set_language_code(m_lang.c_str());
                 } else {
                     auto* textInput = queryInput->mutable_text();
@@ -501,7 +505,7 @@ public:
 		m_streamer->Write(*m_request);
 		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "GStreamer::startStream initial request sent; waiting for responses\n");
 	}
-	bool write(void* data, uint32_t datalen) {
+    bool write(void* data, uint32_t datalen) {
 		if (m_finished) {
 			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "GStreamer::write not writing because we are finished, %p\n", this);
 			return false;
@@ -524,6 +528,8 @@ public:
             audio_config->set_audio_encoding(AudioEncoding::AUDIO_ENCODING_LINEAR_16);
             audio_config->set_single_utterance(true);
             switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "GStreamer::write sent new audio config to start next turn\n");
+            // Mark start of a new turn when sending a fresh audio config
+            markTurnStart();
         } else {
             ai->clear_config();
         }
@@ -576,6 +582,19 @@ public:
     const std::string& qpChannel() const { return m_qpChannel; }
     const std::string& requestParamsJSON() const { return m_requestParamsJSON; }
     const std::string& sessionId() const { return m_sessionId; }
+
+    // Turn timing markers
+    void markTurnStart() {
+        m_turnStartMs = switch_micro_time_now() / 1000;
+        m_finalRecogMs = 0; m_eouMs = 0; m_detectMs = 0;
+    }
+    void markFinalRecog() { if (!m_finalRecogMs) m_finalRecogMs = switch_micro_time_now() / 1000; }
+    void markEOU() { if (!m_eouMs) m_eouMs = switch_micro_time_now() / 1000; }
+    void markDetect() { if (!m_detectMs) m_detectMs = switch_micro_time_now() / 1000; }
+    uint64_t turnStartMs() const { return m_turnStartMs; }
+    uint64_t finalRecogMs() const { return m_finalRecogMs; }
+    uint64_t eouMs() const { return m_eouMs; }
+    uint64_t detectMs() const { return m_detectMs; }
 
     void rotateToAudioConfig(switch_core_session_t* session) {
         switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO,
@@ -672,6 +691,11 @@ private:
     uint32_t m_sampleRate;
     OutputAudioEncoding m_outputEncoding;
     std::string m_requestParamsJSON;
+    // Turn timing
+    uint64_t m_turnStartMs = 0;
+    uint64_t m_finalRecogMs = 0;
+    uint64_t m_eouMs = 0;
+    uint64_t m_detectMs = 0;
 };
 
 static void killcb(struct cap_cb* cb) {
@@ -716,12 +740,16 @@ static void *SWITCH_THREAD_FUNC grpc_read_thread(switch_thread_t *thread, void *
                     bool is_eou = (0 == StreamingRecognitionResult::MessageType_Name(o).compare("END_OF_SINGLE_UTTERANCE"));
                     if (is_eou) {
                         type = DIALOGFLOW_EVENT_END_OF_UTTERANCE;
+                        streamer->markEOU();
                         switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(psession), SWITCH_LOG_DEBUG,
                             "grpc_read_thread: END_OF_SINGLE_UTTERANCE received\n");
                     } else {
                         bool final_only = switch_true(switch_channel_get_variable(channel, "DIALOGFLOW_TRANSCRIPT_FINAL_ONLY"));
                         if (final_only && !rr.is_final()) {
                             suppress = true; // skip interim transcripts
+                        }
+                        if (rr.is_final()) {
+                            streamer->markFinalRecog();
                         }
                     }
                 }
@@ -747,6 +775,46 @@ static void *SWITCH_THREAD_FUNC grpc_read_thread(switch_thread_t *thread, void *
                         }
                     }
                     cJSON* jResponse = parser.parse(response);
+                    // Optionally enrich with diagnostic_info and turn timing
+                    if (response.has_detect_intent_response()) {
+                        const auto& dir2 = response.detect_intent_response();
+                        if (dir2.has_query_result()) {
+                            const auto& qr2 = dir2.query_result();
+                            // Include diagnostic_info when requested (default: on)
+                            const char* diagVar = switch_channel_get_variable(channel, "DIALOGFLOW_INCLUDE_DIAGNOSTIC_INFO");
+                            bool include_diag = (diagVar == NULL) ? true : switch_true(diagVar);
+                            if (include_diag && qr2.has_diagnostic_info()) {
+                                cJSON* jqr = cJSON_GetObjectItemCaseSensitive(jResponse, "query_result");
+                                if (jqr) {
+                                    GRPCParser p2(psession);
+                                    cJSON* diag = p2.parseStruct(qr2.diagnostic_info());
+                                    if (diag) cJSON_AddItemToObject(jqr, "diagnostic_info", diag);
+                                }
+                            }
+                            // Add coarse turn timing when we are emitting INTENT or final transcript
+                            bool add_timing = (type == DIALOGFLOW_EVENT_INTENT);
+                            if (!add_timing && response.has_recognition_result()) {
+                                const auto& rr2 = response.recognition_result();
+                                add_timing = rr2.is_final();
+                            }
+                            if (add_timing) {
+                                uint64_t t0 = streamer->turnStartMs();
+                                uint64_t te = streamer->finalRecogMs() ? streamer->finalRecogMs() : streamer->eouMs();
+                                uint64_t td = streamer->detectMs();
+                                if (t0 && td) {
+                                    cJSON* tt = cJSON_CreateObject();
+                                    cJSON_AddItemToObject(tt, "total_ms", cJSON_CreateNumber((double)(td - t0)));
+                                    if (te && te >= t0 && td >= te) {
+                                        cJSON_AddItemToObject(tt, "asr_ms", cJSON_CreateNumber((double)(te - t0)));
+                                        cJSON_AddItemToObject(tt, "post_asr_ms", cJSON_CreateNumber((double)(td - te)));
+                                    }
+                                    cJSON* jqr = cJSON_GetObjectItemCaseSensitive(jResponse, "query_result");
+                                    if (!jqr) jqr = jResponse; // fallback top-level
+                                    cJSON_AddItemToObject(jqr, "turn_timing", tt);
+                                }
+                            }
+                        }
+                    }
                     // Optionally include request query_params on all DF events
                     bool include_qp = switch_true(switch_channel_get_variable(channel, "DIALOGFLOW_INCLUDE_QUERY_PARAMS"));
                     if (include_qp) {
@@ -772,6 +840,7 @@ static void *SWITCH_THREAD_FUNC grpc_read_thread(switch_thread_t *thread, void *
 			bool playAudio = !audio.empty() ;
             if (response.has_detect_intent_response()) {
                 const auto& dir = response.detect_intent_response();
+                streamer->markDetect();
                 // Set response headers (via channel vars consumed by responseHandler)
                 switch_channel_set_variable(channel, "DF_RESPONSE_ID", dir.response_id().c_str());
                 switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(psession), SWITCH_LOG_DEBUG,
