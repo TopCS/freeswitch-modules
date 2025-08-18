@@ -10,17 +10,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     zlib1g-dev libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
+# Runtime usage: mount repo at /src and generated sources at /gens
 WORKDIR /src
-COPY . /src
 
-# Expect generated sources to be mounted at /gens
-# e.g. docker build --build-arg GENS_DIR=/gens . OR run container with -v
-
-ARG GENS_DIR=/gens
-RUN test -d "$GENS_DIR/google" || (echo "Mount generated sources into /gens (contains google/*)" && exit 1)
-
-RUN bash -lc "scripts/build-deb.sh $GENS_DIR build && true"
-
-# Output
-CMD ["bash", "-lc", "ls -l build/*.deb"]
-
+# Default command shows quick help; typical usage runs the build script
+CMD ["bash", "-lc", "echo 'Usage: docker run --rm -v $PWD:/src -v /abs/path/to/gens:/gens -w /src <image> scripts/build-deb.sh /gens build' && ls -l /gens 2>/dev/null || true"]
