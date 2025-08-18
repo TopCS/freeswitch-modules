@@ -803,10 +803,23 @@ static void *SWITCH_THREAD_FUNC grpc_read_thread(switch_thread_t *thread, void *
                                 uint64_t td = streamer->detectMs();
                                 if (t0 && td) {
                                     cJSON* tt = cJSON_CreateObject();
-                                    cJSON_AddItemToObject(tt, "total_ms", cJSON_CreateNumber((double)(td - t0)));
+                                    uint64_t total = td - t0;
+                                    cJSON_AddItemToObject(tt, "total_ms", cJSON_CreateNumber((double)total));
                                     if (te && te >= t0 && td >= te) {
-                                        cJSON_AddItemToObject(tt, "asr_ms", cJSON_CreateNumber((double)(te - t0)));
-                                        cJSON_AddItemToObject(tt, "post_asr_ms", cJSON_CreateNumber((double)(td - te)));
+                                        uint64_t asr = te - t0;
+                                        uint64_t post = td - te;
+                                        cJSON_AddItemToObject(tt, "asr_ms", cJSON_CreateNumber((double)asr));
+                                        cJSON_AddItemToObject(tt, "post_asr_ms", cJSON_CreateNumber((double)post));
+                                        // Optional logging
+                                        bool log_timing = switch_true(switch_channel_get_variable(channel, "DIALOGFLOW_LOG_TURN_TIMING"));
+                                        if (log_timing) {
+                                            const char* sid = streamer->sessionId().c_str();
+                                            const char* intent = switch_channel_get_variable(channel, "DF_INTENT"); intent = intent ? intent : "";
+                                            const char* page = switch_channel_get_variable(channel, "DF_PAGE"); page = page ? page : "";
+                                            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(psession), SWITCH_LOG_INFO,
+                                                "DF turn timing: total=%llums asr=%llums post_asr=%llums (session=%s intent='%s' page='%s')\n",
+                                                (unsigned long long)total, (unsigned long long)asr, (unsigned long long)post, sid, intent, page);
+                                        }
                                     }
                                     cJSON* jqr = cJSON_GetObjectItemCaseSensitive(jResponse, "query_result");
                                     if (!jqr) jqr = jResponse; // fallback top-level
