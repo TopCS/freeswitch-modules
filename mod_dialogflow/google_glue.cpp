@@ -253,35 +253,39 @@ public:
             else m_outputEncoding = OutputAudioEncoding::OUTPUT_AUDIO_ENCODING_LINEAR_16;
         }
 
-		if ((var = switch_channel_get_variable(channel, "GOOGLE_APPLICATION_CREDENTIALS"))) {
-			std::string input = var;
-			std::string json = input;
-			bool read_from_file = false;
-			if (!input.empty() && (input[0] == '/' || input.rfind(".json") == input.size() - 5)) {
-				// Looks like a path; try to read file
-				std::ifstream fs(input);
-				if (fs.good()) {
-					json.assign((std::istreambuf_iterator<char>(fs)), std::istreambuf_iterator<char>());
-					read_from_file = true;
-				} else {
-					switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING, "GStreamer credentials path not readable: %s; falling back to default creds\n", input.c_str());
+			if ((var = switch_channel_get_variable(channel, "GOOGLE_APPLICATION_CREDENTIALS"))) {
+				std::string input = var;
+				std::string json = input;
+				bool read_from_file = false;
+				if (!input.empty() && (input[0] == '/' || input.rfind(".json") == input.size() - 5)) {
+					// Looks like a path; try to read file
+					std::ifstream fs(input);
+					if (fs.good()) {
+						json.assign((std::istreambuf_iterator<char>(fs)), std::istreambuf_iterator<char>());
+						read_from_file = true;
+					} else {
+						switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING, "GStreamer credentials path not readable: %s; falling back to default creds if available\n", input.c_str());
+						if (!hasDefaultCredentials) {
+							// No ADC available; fail fast rather than attempting a stream that will hard-fail
+							throw std::runtime_error("GOOGLE_APPLICATION_CREDENTIALS path not readable and no default credentials configured");
+						}
+					}
 				}
-			}
 
-			if (!json.empty()) {
-				auto callCreds = grpc::ServiceAccountJWTAccessCredentials(json, INT64_MAX);
-				auto channelCreds = grpc::SslCredentials(grpc::SslCredentialsOptions());
-				auto creds = grpc::CompositeChannelCredentials(channelCreds, callCreds);
-				m_channel = grpc::CreateChannel(endpoint, creds);
-				switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "GStreamer using %s credentials for channel\n", read_from_file ? "file" : "inline JSON");
+				if (!json.empty()) {
+					auto callCreds = grpc::ServiceAccountJWTAccessCredentials(json, INT64_MAX);
+					auto channelCreds = grpc::SslCredentials(grpc::SslCredentialsOptions());
+					auto creds = grpc::CompositeChannelCredentials(channelCreds, callCreds);
+					m_channel = grpc::CreateChannel(endpoint, creds);
+					switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "GStreamer using %s credentials for channel\n", read_from_file ? "file" : "inline JSON");
+				} else {
+					auto creds = grpc::GoogleDefaultCredentials();
+					m_channel = grpc::CreateChannel(endpoint, creds);
+				}
 			} else {
 				auto creds = grpc::GoogleDefaultCredentials();
 				m_channel = grpc::CreateChannel(endpoint, creds);
 			}
-		} else {
-			auto creds = grpc::GoogleDefaultCredentials();
-			m_channel = grpc::CreateChannel(endpoint, creds);
-		}
     }
 
 	~GStreamer() {
@@ -405,7 +409,7 @@ public:
                     }
                     auto* audio_input = queryInput->mutable_audio();
                     auto* audio_config = audio_input->mutable_config();
-                    audio_config->set_sample_rate_hertz(16000);
+                    audio_config->set_sample_rate_hertz((int)m_sampleRate);
                     audio_config->set_audio_encoding(AudioEncoding::AUDIO_ENCODING_LINEAR_16);
                     audio_config->set_single_utterance(true);
                     // Mark start of a text+audio turn (we'll send audio next)
@@ -457,7 +461,7 @@ public:
         else {
             auto* audio_input = queryInput->mutable_audio();
             auto* audio_config = audio_input->mutable_config();
-            audio_config->set_sample_rate_hertz(16000);
+            audio_config->set_sample_rate_hertz((int)m_sampleRate);
             audio_config->set_audio_encoding(AudioEncoding::AUDIO_ENCODING_LINEAR_16);
             audio_config->set_single_utterance(true);
             queryInput->set_language_code(m_lang.c_str());
@@ -469,8 +473,8 @@ public:
                 cJSON_Delete(chvars);
             }
         }
-        switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "GStreamer::startStream requesting OutputAudio in LINEAR16 @16000Hz; custom params? %s\n",
-                          isAnyOutputAudioConfigChanged() ? "yes" : "no");
+        switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "GStreamer::startStream requesting OutputAudio in LINEAR16 @%uHz; custom params? %s\n",
+                          (unsigned)m_sampleRate, isAnyOutputAudioConfigChanged() ? "yes" : "no");
         auto* outputAudioConfig = m_request->mutable_output_audio_config();
         outputAudioConfig->set_sample_rate_hertz((int)m_sampleRate);
         outputAudioConfig->set_audio_encoding(m_outputEncoding);
@@ -582,6 +586,7 @@ public:
     const std::string& qpChannel() const { return m_qpChannel; }
     const std::string& requestParamsJSON() const { return m_requestParamsJSON; }
     const std::string& sessionId() const { return m_sessionId; }
+    uint32_t sampleRate() const { return m_sampleRate; }
 
     // Turn timing markers
     void markTurnStart() {
@@ -1309,7 +1314,12 @@ extern "C" {
 
 		if (!hasDefaultCredentials && !switch_channel_get_variable(channel, "GOOGLE_APPLICATION_CREDENTIALS")) {
 			switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, 
-				"missing credentials: GOOGLE_APPLICATION_CREDENTIALS must be suuplied either as an env variable (path to file) or a channel variable (json string)\n");
+				"missing credentials: GOOGLE_APPLICATION_CREDENTIALS must be supplied as env (path) or channel var (JSON); emitting dialogflow::error and aborting.\n");
+			if (errorHandler) {
+				std::ostringstream s;
+				s << "{\"msg\":\"missing credentials\",\"code\":16,\"category\":\"auth\",\"retryable\":false}";
+				errorHandler(session, s.str().c_str());
+			}
 			status = SWITCH_STATUS_FALSE;
 			goto done; 
 		}
@@ -1329,11 +1339,20 @@ extern "C" {
         try {
             cb->streamer = new GStreamer(session, lang, projectId, event, text, samples_per_second);
         } catch (const std::exception& e) {
-            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_CRIT, "GStreamer construction failed: %s\n", e.what());
+            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_CRIT,
+                "Dialogflow init error (construction): %s. Emitting dialogflow::error and aborting.\n", e.what());
+            if (errorHandler) {
+                const char* cat = (strstr(e.what(), "credential") || strstr(e.what(), "Credentials")) ? "auth" : "unknown";
+                int code = (strcmp(cat, "auth") == 0) ? 16 : -1;
+                std::ostringstream s; s << "{\"msg\":\"" << e.what() << "\",\"code\":" << code << ",\"category\":\"" << cat << "\",\"retryable\":false}";
+                errorHandler(session, s.str().c_str());
+            }
             status = SWITCH_STATUS_FALSE;
             goto done;
         } catch (...) {
-            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_CRIT, "GStreamer construction failed with unknown error\n");
+            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_CRIT,
+                "Dialogflow init error (construction unknown). Emitting dialogflow::error and aborting.\n");
+            if (errorHandler) errorHandler(session, "{\"msg\":\"construction failed\",\"code\":-1,\"category\":\"unknown\",\"retryable\":false}");
             status = SWITCH_STATUS_FALSE;
             goto done;
         }
@@ -1342,15 +1361,25 @@ extern "C" {
         try {
             ((GStreamer*)cb->streamer)->startStream(session, event, text);
         } catch (const std::exception& e) {
-            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_CRIT, "GStreamer startStream failed: %s\n", e.what());
+            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_CRIT,
+                "Dialogflow init error (startStream): %s. Emitting dialogflow::error and aborting.\n", e.what());
+            if (errorHandler) {
+                const char* cat = (strstr(e.what(), "credential") || strstr(e.what(), "Credentials")) ? "auth" : "unknown";
+                int code = (strcmp(cat, "auth") == 0) ? 16 : -1;
+                std::ostringstream s; s << "{\"msg\":\"" << e.what() << "\",\"code\":" << code << ",\"category\":\"" << cat << "\",\"retryable\":false}";
+                errorHandler(session, s.str().c_str());
+            }
             status = SWITCH_STATUS_FALSE;
             goto done;
         } catch (...) {
-            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_CRIT, "GStreamer startStream failed with unknown error\n");
+            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_CRIT,
+                "Dialogflow init error (startStream unknown). Emitting dialogflow::error and aborting.\n");
+            if (errorHandler) errorHandler(session, "{\"msg\":\"startStream failed\",\"code\":-1,\"category\":\"unknown\",\"retryable\":false}");
             status = SWITCH_STATUS_FALSE;
             goto done;
         }
-		cb->resampler = speex_resampler_init(1, 8000, 16000, SWITCH_RESAMPLE_QUALITY, &err);
+		// Resample from the channel read rate to the Dialogflow input sample rate
+		cb->resampler = speex_resampler_init(1, (spx_uint32_t)samples_per_second, (spx_uint32_t)((GStreamer*)cb->streamer)->sampleRate(), SWITCH_RESAMPLE_QUALITY, &err);
 		if (0 != err) {
 			switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "%s: Error initializing resampler: %s.\n", 
 						switch_channel_get_name(channel), speex_resampler_strerror(err));
