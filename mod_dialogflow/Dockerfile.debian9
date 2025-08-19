@@ -1,0 +1,58 @@
+FROM debian:stretch-slim
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Base toolchain and backports for newer GCC
+RUN echo 'deb http://deb.debian.org/debian stretch-backports main' > /etc/apt/sources.list.d/backports.list \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends \
+    ca-certificates wget curl git unzip pkg-config \
+    build-essential \
+    g++-8 \
+    libspeexdsp-dev zlib1g-dev libssl-dev \
+ && rm -rf /var/lib/apt/lists/*
+
+# Set GCC/G++ 8 as default
+RUN update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-8 80 \
+ && update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-8 80
+
+# Install a recent CMake (>= 3.18) prebuilt
+ENV CMAKE_VERSION=3.25.2
+RUN cd /tmp \
+ && curl -fsSL -o cmake.tar.gz https://github.com/Kitware/CMake/releases/download/v${CMAKE_VERSION}/cmake-${CMAKE_VERSION}-linux-x86_64.tar.gz \
+ && tar -C /opt -xzf cmake.tar.gz \
+ && ln -s /opt/cmake-${CMAKE_VERSION}-linux-x86_64/bin/cmake /usr/local/bin/cmake \
+ && ln -s /opt/cmake-${CMAKE_VERSION}-linux-x86_64/bin/ctest /usr/local/bin/ctest \
+ && ln -s /opt/cmake-${CMAKE_VERSION}-linux-x86_64/bin/cpack /usr/local/bin/cpack \
+ && rm -f /tmp/cmake.tar.gz
+
+# Build and install gRPC (and third_party providers) to /usr/local
+# This will also build and install protobuf and provide pkg-config files
+ENV GRPC_VERSION=v1.51.1
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+    libkrb5-3 libgssapi-krb5-2 \
+ && rm -rf /var/lib/apt/lists/* \
+ && cd /tmp \
+ && git clone -b ${GRPC_VERSION} --recurse-submodules https://github.com/grpc/grpc.git \
+ && mkdir -p /tmp/grpc-build \
+ && cd /tmp/grpc-build \
+ && cmake -DgRPC_BUILD_TESTS=OFF -DgRPC_INSTALL=ON \
+          -DgRPC_ABSL_PROVIDER=module \
+          -DgRPC_RE2_PROVIDER=module \
+          -DgRPC_CARES_PROVIDER=module \
+          -DgRPC_PROTOBUF_PROVIDER=module \
+          -DgRPC_SSL_PROVIDER=module \
+          -DgRPC_ZLIB_PROVIDER=module \
+          ../grpc \
+ && make -j"$(nproc)" \
+ && make install \
+ && ldconfig \
+ && rm -rf /tmp/grpc /tmp/grpc-build
+
+# Runtime usage: mount repo at /src and generated sources at /gens
+WORKDIR /src
+
+# Default command shows quick help; typical usage runs the build script
+CMD ["bash", "-lc", "echo 'Usage: docker run --rm -v $PWD:/src -v /abs/path/to/gens:/gens -e FS_PREFIX=/usr/local/freeswitch -w /src <image> scripts/build-deb.sh /gens build-stretch' && pkg-config --modversion grpc++ protobuf || true"]
+
