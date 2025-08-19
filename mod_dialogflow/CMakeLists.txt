@@ -8,6 +8,8 @@ set(CMAKE_SHARED_LIBRARY_PREFIX "")
 
 option(ENABLE_LOCAL "Add /usr/local/freeswitch pkgconfig path" ON)
 set(GENS_DIR "" CACHE PATH "Path to generated Google APIs C++ sources root (contains google/...")
+# Allow overriding the FreeSWITCH modules installation directory
+set(FS_MOD_DIR "" CACHE PATH "Override FreeSWITCH modules dir (e.g., /usr/lib/freeswitch/mod)")
 
 # Embed build metadata (git hash, date)
 execute_process(
@@ -36,8 +38,19 @@ pkg_check_modules(GRPC REQUIRED IMPORTED_TARGET grpc)
 pkg_check_modules(Protobuf REQUIRED IMPORTED_TARGET protobuf)
 pkg_check_modules(SPEEXDSP REQUIRED speexdsp)
 
+# Determine FreeSWITCH modules installation directory from override or pkg-config
+if(NOT FS_MOD_DIR OR FS_MOD_DIR STREQUAL "")
+  pkg_get_variable(FS_MOD_DIR freeswitch modulesdir)
+endif()
+if(NOT FS_MOD_DIR OR FS_MOD_DIR STREQUAL "")
+  # Fallbacks: Debian default first, then /usr/local
+  if(EXISTS "/usr/lib/freeswitch/mod")
+    set(FS_MOD_DIR "/usr/lib/freeswitch/mod")
+  else()
+    set(FS_MOD_DIR "/usr/local/freeswitch/mod")
+  endif()
+endif()
 message(STATUS "FreeSWITCH modules dir: ${FS_MOD_DIR}")
-pkg_get_variable(FS_MOD_DIR freeswitch modulesdir)
 
 file(GLOB_RECURSE GENS_SOURCES
   "${GENS_DIR}/google/cloud/dialogflow/cx/v3/*.cc"
@@ -108,9 +121,54 @@ set(CPACK_PACKAGE_NAME "freeswitch-mod-dialogflow")
 set(CPACK_PACKAGE_VERSION ${PROJECT_VERSION})
 set(CPACK_PACKAGE_CONTACT "Maintainer <noreply@example.com>")
 set(CPACK_DEBIAN_PACKAGE_SECTION "net")
-set(CPACK_DEBIAN_ARCHITECTURE ${CMAKE_SYSTEM_PROCESSOR})
-set(CPACK_PACKAGE_FILE_NAME "${CPACK_PACKAGE_NAME}_${CPACK_PACKAGE_VERSION}_${CMAKE_SYSTEM_PROCESSOR}")
-# Runtime deps: libresampler (speexdsp), freeswitch libs, grpc, protobuf (names vary per distro)
-set(CPACK_DEBIAN_PACKAGE_DEPENDS "libfreeswitch1, libspeexdsp1, libprotobuf, libgrpc++")
+
+# Detect Debian architecture for correct naming (e.g., amd64 instead of x86_64)
+set(CPACK_DEBIAN_ARCHITECTURE "")
+execute_process(
+  COMMAND dpkg --print-architecture
+  OUTPUT_VARIABLE DPKG_ARCH
+  OUTPUT_STRIP_TRAILING_WHITESPACE
+  ERROR_QUIET
+)
+if(DPKG_ARCH)
+  set(CPACK_DEBIAN_ARCHITECTURE "${DPKG_ARCH}")
+else()
+  # Fallback mapping
+  if(CMAKE_SYSTEM_PROCESSOR STREQUAL "x86_64")
+    set(CPACK_DEBIAN_ARCHITECTURE "amd64")
+  elseif(CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64")
+    set(CPACK_DEBIAN_ARCHITECTURE "arm64")
+  else()
+    set(CPACK_DEBIAN_ARCHITECTURE "${CMAKE_SYSTEM_PROCESSOR}")
+  endif()
+endif()
+
+set(CPACK_PACKAGE_FILE_NAME "${CPACK_PACKAGE_NAME}_${CPACK_PACKAGE_VERSION}_${CPACK_DEBIAN_ARCHITECTURE}")
+
+# Optional: bundle gRPC/protobuf shared libs and set RPATH so the module can load them from its install dir
+option(BUNDLE_GRPC_DEPS "Bundle gRPC/protobuf shared libs into the module dir" OFF)
+if (BUNDLE_GRPC_DEPS)
+  # Ensure the loader searches alongside the module
+  set_target_properties(mod_dialogflow PROPERTIES INSTALL_RPATH "\$ORIGIN")
+  # Copy a minimal set of deps from /usr/local/lib (where our Docker images install gRPC/protobuf)
+  set(GRPC_LIB_DIR "/usr/local/lib")
+  install(DIRECTORY ${GRPC_LIB_DIR}/ DESTINATION ${FS_MOD_DIR}
+    FILES_MATCHING
+      PATTERN "libgrpc*.so*"
+      PATTERN "libprotobuf*.so*"
+      PATTERN "libabsl_*.so*"
+      PATTERN "libre2*.so*"
+      PATTERN "libcares*.so*"
+      PATTERN "libupb*.so*"
+      PATTERN "libaddress_sorting*.so*"
+  )
+endif()
+
+# Runtime deps (best-effort names for Debian)
+if (BUNDLE_GRPC_DEPS)
+  set(CPACK_DEBIAN_PACKAGE_DEPENDS "freeswitch, libspeexdsp1")
+else()
+  set(CPACK_DEBIAN_PACKAGE_DEPENDS "freeswitch, libspeexdsp1, libprotobuf32, libgrpc++1.51, libgrpc29")
+endif()
 
 include(CPack)

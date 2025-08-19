@@ -36,6 +36,7 @@ struct cap_cb {
     char lang[MAX_LANG];
     char projectId[MAX_PROJECT_ID];
     uint64_t lastTranscriptMs;
+    switch_bool_t stopping;
 
 };
 

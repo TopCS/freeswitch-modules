@@ -64,6 +64,8 @@ static void responseHandler(switch_core_session_t* session, const char * type, c
     if ((h = switch_channel_get_variable(channel, "DF_INTENT"))) switch_event_add_header_string(event, SWITCH_STACK_BOTTOM, "DF-Intent", h);
     if ((h = switch_channel_get_variable(channel, "DF_PAGE"))) switch_event_add_header_string(event, SWITCH_STACK_BOTTOM, "DF-Page", h);
     if ((h = switch_channel_get_variable(channel, "DF_AUDIO_PATH"))) switch_event_add_header_string(event, SWITCH_STACK_BOTTOM, "DF-Audio-Path", h);
+    // Back-compat: also include payload as header 'Response' for clients that expect body.response
+    switch_event_add_header_string(event, SWITCH_STACK_BOTTOM, "Response", json);
     switch_event_add_body(event, "%s", json);
     switch_event_fire(&event);
 }
@@ -75,6 +77,8 @@ static void errorHandler(switch_core_session_t* session, const char * json) {
 
     switch_event_create_subclass(&event, SWITCH_EVENT_CUSTOM, DIALOGFLOW_EVENT_ERROR);
     switch_channel_event_set_data(channel, event);
+    // Back-compat: also include payload as header 'Response'
+    switch_event_add_header_string(event, SWITCH_STACK_BOTTOM, "Response", json);
     switch_event_add_body(event, "%s", json);
 
     switch_event_fire(&event);

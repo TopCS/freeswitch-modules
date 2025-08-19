@@ -24,8 +24,10 @@ echo "Running packaging inside container ..."
 RUN_ARGS=(--rm -v "$(pwd)":/src -v "$GENS_DIR":/gens -w /src)
 if [[ -d "$FS_PREFIX" ]]; then
   echo "Mounting FreeSWITCH prefix: $FS_PREFIX"
-  RUN_ARGS+=(-v "$FS_PREFIX":/usr/local/freeswitch:ro -e PKG_CONFIG_PATH=/usr/local/freeswitch/lib/pkgconfig:
-${PKG_CONFIG_PATH:-})
+  RUN_ARGS+=(
+    -v "$FS_PREFIX":/usr/local/freeswitch:ro
+    -e PKG_CONFIG_PATH=/usr/local/freeswitch/lib/pkgconfig:${PKG_CONFIG_PATH:-}
+  )
 fi
 docker run "${RUN_ARGS[@]}" "$IMAGE_NAME" bash -lc "scripts/build-deb.sh /gens $BUILD_DIR"
 

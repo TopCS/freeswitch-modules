@@ -3,18 +3,20 @@ FROM debian:stretch-slim
 ENV DEBIAN_FRONTEND=noninteractive
 
 # Base toolchain and backports for newer GCC
-RUN echo 'deb http://deb.debian.org/debian stretch-backports main' > /etc/apt/sources.list.d/backports.list \
- && apt-get update \
+RUN printf '%s\n' \
+    'deb http://archive.debian.org/debian stretch main' \
+    'deb http://archive.debian.org/debian stretch-backports main' \
+    'deb http://archive.debian.org/debian-security stretch/updates main' \
+    > /etc/apt/sources.list \
+ && apt-get -o Acquire::Check-Valid-Until=false -o Acquire::AllowInsecureRepositories=true update \
  && apt-get install -y --no-install-recommends \
     ca-certificates wget curl git unzip pkg-config \
     build-essential \
-    g++-8 \
     libspeexdsp-dev zlib1g-dev libssl-dev \
  && rm -rf /var/lib/apt/lists/*
 
 # Set GCC/G++ 8 as default
-RUN update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-8 80 \
- && update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-8 80
+# Use default GCC from Stretch (GCC 6), target C++14 in grpc and module builds
 
 # Install a recent CMake (>= 3.18) prebuilt
 ENV CMAKE_VERSION=3.25.2
@@ -37,7 +39,7 @@ RUN apt-get update \
  && git clone -b ${GRPC_VERSION} --recurse-submodules https://github.com/grpc/grpc.git \
  && mkdir -p /tmp/grpc-build \
  && cd /tmp/grpc-build \
- && cmake -DgRPC_BUILD_TESTS=OFF -DgRPC_INSTALL=ON \
+ && cmake -DCMAKE_CXX_STANDARD=14 -DgRPC_BUILD_TESTS=OFF -DgRPC_INSTALL=ON \
           -DgRPC_ABSL_PROVIDER=module \
           -DgRPC_RE2_PROVIDER=module \
           -DgRPC_CARES_PROVIDER=module \
@@ -55,4 +57,3 @@ WORKDIR /src
 
 # Default command shows quick help; typical usage runs the build script
 CMD ["bash", "-lc", "echo 'Usage: docker run --rm -v $PWD:/src -v /abs/path/to/gens:/gens -e FS_PREFIX=/usr/local/freeswitch -w /src <image> scripts/build-deb.sh /gens build-stretch' && pkg-config --modversion grpc++ protobuf || true"]
-

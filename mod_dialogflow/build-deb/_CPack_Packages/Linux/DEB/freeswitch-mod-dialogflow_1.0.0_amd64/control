@@ -1,0 +1,10 @@
+Architecture: amd64
+Depends: freeswitch, libspeexdsp1, libprotobuf32, libgrpc++1.51, libgrpc29
+Description: Dialogflow CX module for FreeSWITCH
+Maintainer: Maintainer <noreply@example.com>
+Package: freeswitch-mod-dialogflow
+Priority: optional
+Section: net
+Version: 1.0.0
+Installed-Size: 9121
+

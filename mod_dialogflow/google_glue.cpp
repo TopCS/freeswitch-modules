@@ -300,8 +300,14 @@ public:
 		m_context= std::make_shared<grpc::ClientContext>();
 		m_stub = Sessions::NewStub(m_channel);
 
-        snprintf(szSession, 256, "projects/%s/locations/%s/agents/%s/sessions/%s", 
-                    m_projectId.c_str(), m_regionId.c_str(), m_agentId.c_str(), m_sessionId.c_str());
+        // Use environment-specific session path when provided (non-draft)
+        if (!m_environment.empty() && strcasecmp(m_environment.c_str(), "draft") != 0) {
+            snprintf(szSession, 256, "projects/%s/locations/%s/agents/%s/environments/%s/sessions/%s",
+                     m_projectId.c_str(), m_regionId.c_str(), m_agentId.c_str(), m_environment.c_str(), m_sessionId.c_str());
+        } else {
+            snprintf(szSession, 256, "projects/%s/locations/%s/agents/%s/sessions/%s",
+                     m_projectId.c_str(), m_regionId.c_str(), m_agentId.c_str(), m_sessionId.c_str());
+        }
 
         // Sanity log: print the composed CX session path once per call for observability
         switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE,
@@ -465,6 +471,8 @@ public:
             audio_config->set_audio_encoding(AudioEncoding::AUDIO_ENCODING_LINEAR_16);
             audio_config->set_single_utterance(true);
             queryInput->set_language_code(m_lang.c_str());
+            // Mark start of initial audio-configured turn
+            markTurnStart();
             // Optionally inject channel variables even for pure audio start
             if (cJSON* chvars = collectChannelVarsAsJSON(session)) {
                 auto* qp = m_request->mutable_query_params();
@@ -614,8 +622,13 @@ public:
         m_context = std::make_shared<grpc::ClientContext>();
         // Reuse same session path
         char szSession[256];
-        snprintf(szSession, 256, "projects/%s/locations/%s/agents/%s/sessions/%s",
-                 m_projectId.c_str(), m_regionId.c_str(), m_agentId.c_str(), m_sessionId.c_str());
+        if (!m_environment.empty() && strcasecmp(m_environment.c_str(), "draft") != 0) {
+            snprintf(szSession, 256, "projects/%s/locations/%s/agents/%s/environments/%s/sessions/%s",
+                     m_projectId.c_str(), m_regionId.c_str(), m_agentId.c_str(), m_environment.c_str(), m_sessionId.c_str());
+        } else {
+            snprintf(szSession, 256, "projects/%s/locations/%s/agents/%s/sessions/%s",
+                     m_projectId.c_str(), m_regionId.c_str(), m_agentId.c_str(), m_sessionId.c_str());
+        }
         m_request->set_session(szSession);
 
         auto* qi = m_request->mutable_query_input();
@@ -663,6 +676,8 @@ public:
         if (!m_qpChannel.empty()) switch_channel_set_variable(channel, "DF_CHANNEL", m_qpChannel.c_str());
 
         m_streamer = m_stub->StreamingDetectIntent(m_context.get());
+        // Mark start of the new audio-configured turn
+        markTurnStart();
         m_streamer->Write(*m_request);
         // Subsequent writes will send only audio bytes
     }
@@ -733,6 +748,12 @@ static void *SWITCH_THREAD_FUNC grpc_read_thread(switch_thread_t *thread, void *
 			switch_channel_t* channel = switch_core_session_get_channel(psession);
 			GRPCParser parser(psession);
 
+            // If stopping requested, break out quickly
+            if (cb->stopping || !switch_channel_ready(channel)) {
+                switch_core_session_rwunlock(psession);
+                return NULL;
+            }
+
             if (response.has_detect_intent_response() || response.has_recognition_result()) {
                 // Determine event type and whether to suppress interim transcripts
                 const char* type = DIALOGFLOW_EVENT_TRANSCRIPTION;
@@ -760,6 +781,10 @@ static void *SWITCH_THREAD_FUNC grpc_read_thread(switch_thread_t *thread, void *
                 }
 
                 if (!suppress) {
+                    // If this is a detect_intent_response, mark detection time before composing payload
+                    if (response.has_detect_intent_response()) {
+                        streamer->markDetect();
+                    }
                     // Optional throttle for interim transcripts
                     if (type == DIALOGFLOW_EVENT_TRANSCRIPTION) {
                         bool final_only = switch_true(switch_channel_get_variable(channel, "DIALOGFLOW_TRANSCRIPT_FINAL_ONLY"));
@@ -797,8 +822,11 @@ static void *SWITCH_THREAD_FUNC grpc_read_thread(switch_thread_t *thread, void *
                                 }
                             }
                             // Add coarse turn timing when we are emitting INTENT or final transcript
-                            bool add_timing = (type == DIALOGFLOW_EVENT_INTENT);
-                            if (!add_timing && response.has_recognition_result()) {
+                            // Controlled by DIALOGFLOW_INCLUDE_TURN_TIMING (default: true)
+                            const char* ttVar = switch_channel_get_variable(channel, "DIALOGFLOW_INCLUDE_TURN_TIMING");
+                            bool include_timing = (ttVar == NULL) ? true : switch_true(ttVar);
+                            bool add_timing = include_timing && (type == DIALOGFLOW_EVENT_INTENT);
+                            if (!add_timing && include_timing && response.has_recognition_result()) {
                                 const auto& rr2 = response.recognition_result();
                                 add_timing = rr2.is_final();
                             }
@@ -858,7 +886,6 @@ static void *SWITCH_THREAD_FUNC grpc_read_thread(switch_thread_t *thread, void *
 			bool playAudio = !audio.empty() ;
             if (response.has_detect_intent_response()) {
                 const auto& dir = response.detect_intent_response();
-                streamer->markDetect();
                 // Set response headers (via channel vars consumed by responseHandler)
                 switch_channel_set_variable(channel, "DF_RESPONSE_ID", dir.response_id().c_str());
                 switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(psession), SWITCH_LOG_DEBUG,
@@ -1137,7 +1164,7 @@ static void *SWITCH_THREAD_FUNC grpc_read_thread(switch_thread_t *thread, void *
             }
 
             // save audio
-            if (playAudio) {
+            if (playAudio && !cb->stopping) {
                 // Do not attempt to play on a channel that is no longer ready
                 if (!switch_channel_ready(channel)) {
                     switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(psession), SWITCH_LOG_WARNING,
@@ -1195,17 +1222,19 @@ static void *SWITCH_THREAD_FUNC grpc_read_thread(switch_thread_t *thread, void *
 				if (will_autoplay && switch_channel_get_variable(channel, "DIALOGFLOW_AUTOPLAY_SYNC") == NULL) {
 					autoplay_sync = true; // default to sync to avoid no_input during long prompts
 				}
-                if (will_autoplay) {
+                if (will_autoplay && !cb->stopping) {
                     if (autoplay_sync) {
                         // Play synchronously so we know when it finishes
                         switch_status_t st = switch_ivr_play_file(psession, NULL, s.str().c_str(), NULL);
                         switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(psession), SWITCH_LOG_INFO,
                             "Auto-playing Dialogflow audio synchronously: %s (status=%d)\n", s.str().c_str(), st);
                         // Resume streaming and rotate to a fresh audio-configured stream for next user turn
-                        switch_mutex_lock(cb->mutex);
-                        streamer->setPaused(false);
-                        streamer->rotateToAudioConfig(psession);
-                        switch_mutex_unlock(cb->mutex);
+                        if (!cb->stopping) {
+                            switch_mutex_lock(cb->mutex);
+                            streamer->setPaused(false);
+                            streamer->rotateToAudioConfig(psession);
+                            switch_mutex_unlock(cb->mutex);
+                        }
                     } else {
                         // Fallback: async broadcast (legacy behavior)
                         char args[1024];
@@ -1217,17 +1246,21 @@ static void *SWITCH_THREAD_FUNC grpc_read_thread(switch_thread_t *thread, void *
                             "Auto-playing Dialogflow audio via uuid_broadcast: %s (status=%d)\n", args, st);
                         switch_safe_free(stream.data);
                         // Rotate immediately to begin listening during async playback
+                        if (!cb->stopping) {
+                            switch_mutex_lock(cb->mutex);
+                            if (streamer->isPaused()) streamer->setPaused(false);
+                            streamer->rotateToAudioConfig(psession);
+                            switch_mutex_unlock(cb->mutex);
+                        }
+                    }
+                } else {
+                    // Not auto-playing here. If we paused earlier, resume and rotate now.
+                    if (!cb->stopping) {
                         switch_mutex_lock(cb->mutex);
                         if (streamer->isPaused()) streamer->setPaused(false);
                         streamer->rotateToAudioConfig(psession);
                         switch_mutex_unlock(cb->mutex);
                     }
-                } else {
-                    // Not auto-playing here. If we paused earlier, resume and rotate now.
-                    switch_mutex_lock(cb->mutex);
-                    if (streamer->isPaused()) streamer->setPaused(false);
-                    streamer->rotateToAudioConfig(psession);
-                    switch_mutex_unlock(cb->mutex);
                 }
 			}
 			switch_core_session_rwunlock(psession);
@@ -1247,17 +1280,18 @@ static void *SWITCH_THREAD_FUNC grpc_read_thread(switch_thread_t *thread, void *
 			s << "{\"msg\": \"" << status.error_message() << "\", \"code\": " << status.error_code();
 			// Categorize and mark retryable
 			const int ec = status.error_code();
-			const char* category = "unknown";
-			bool retryable = false;
-			switch (ec) {
-				case grpc::StatusCode::UNAUTHENTICATED:
-				case grpc::StatusCode::PERMISSION_DENIED: category = "auth"; break;
-				case grpc::StatusCode::RESOURCE_EXHAUSTED: category = "quota"; break;
-				case grpc::StatusCode::UNAVAILABLE: category = "network"; retryable = true; break;
-				case grpc::StatusCode::DEADLINE_EXCEEDED: category = "timeout"; retryable = true; break;
-				case grpc::StatusCode::INTERNAL: category = "server"; retryable = true; break;
-				default: break;
-			}
+            const char* category = "unknown";
+            bool retryable = false;
+            switch (ec) {
+                case grpc::StatusCode::UNAUTHENTICATED:
+                case grpc::StatusCode::PERMISSION_DENIED: category = "auth"; break;
+                case grpc::StatusCode::RESOURCE_EXHAUSTED: category = "quota"; break;
+                case grpc::StatusCode::UNAVAILABLE: category = "network"; retryable = true; break;
+                case grpc::StatusCode::DEADLINE_EXCEEDED: category = "timeout"; retryable = true; break;
+                case grpc::StatusCode::INTERNAL: category = "server"; retryable = true; break;
+                case grpc::StatusCode::NOT_FOUND: category = "not_found"; break;
+                default: break;
+            }
 			s << ", \"category\": \"" << category << "\"";
 			s << ", \"retryable\": " << (retryable ? "true" : "false");
 			if (status.error_details().length() > 0) {
@@ -1327,6 +1361,7 @@ extern "C" {
 		strncpy(cb->sessionId, switch_core_session_get_uuid(session), 256);
 		cb->responseHandler = responseHandler;
 		cb->errorHandler = errorHandler;
+		cb->stopping = SWITCH_FALSE;
 
 		if (switch_mutex_init(&cb->mutex, SWITCH_MUTEX_NESTED, pool) != SWITCH_STATUS_SUCCESS) {
 			switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "Error initializing mutex\n");
@@ -1416,18 +1451,32 @@ extern "C" {
 			struct cap_cb *cb = (struct cap_cb *) switch_core_media_bug_get_user_data(bug);
 			switch_status_t st;
 
-			// close connection and get final responses
+			// Best-effort: stop any ongoing synchronous playback immediately via uuid_break
+			switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "google_dialogflow_session_cleanup: requesting stop of any ongoing playback (uuid_break)\n");
+			{
+				const char* suuid = switch_core_session_get_uuid(session);
+				char args[256]; snprintf(args, sizeof(args), "%s all", suuid ? suuid : "");
+				switch_stream_handle_t stream = { 0 }; SWITCH_STANDARD_STREAM(stream);
+				( void ) switch_api_execute("uuid_break", args, NULL, &stream);
+				switch_safe_free(stream.data);
+			}
+
+			// close connection and get final responses (avoid deadlock with read thread)
 			switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "google_dialogflow_session_cleanup: acquiring lock\n");
 			switch_mutex_lock(cb->mutex);
 			switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "google_dialogflow_session_cleanup: acquired lock\n");
+			// Mark stopping to prevent the read thread from rotating/playing further
+			cb->stopping = SWITCH_TRUE;
 			GStreamer* streamer = (GStreamer *) cb->streamer;
 			if (streamer) {
 				// Cancel any in-flight stream to break out of read loop quickly
 				streamer->cancel();
 				switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "google_dialogflow_session_cleanup: sending writesDone..\n");
 				streamer->writesDone();
-				streamer->finish();
 			}
+			// Release lock before joining; the read thread may lock it after playback
+			switch_mutex_unlock(cb->mutex);
+
 			if (cb->thread) {
 				switch_status_t retval;
 				switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, "google_dialogflow_session_cleanup: waiting for read thread to complete\n");
@@ -1435,11 +1484,15 @@ extern "C" {
 				cb->thread = NULL;
 				switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, "google_dialogflow_session_cleanup: read thread completed\n");
 			}
-			killcb(cb);
 
+			// Reacquire lock and finalize cleanup
+			switch_mutex_lock(cb->mutex);
+			if (cb->streamer) {
+				try { ((GStreamer*)cb->streamer)->finish(); } catch (...) {}
+			}
+			killcb(cb);
 			switch_channel_set_private(channel, MY_BUG_NAME, NULL);
 			if (!channelIsClosing) switch_core_media_bug_remove(session, &bug);
-
 			switch_mutex_unlock(cb->mutex);
 			switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, "google_dialogflow_session_cleanup: Closed google session\n");
 
@@ -1461,7 +1514,7 @@ extern "C" {
 
 		if (switch_mutex_trylock(cb->mutex) == SWITCH_STATUS_SUCCESS) {
 			GStreamer* streamer = (GStreamer *) cb->streamer;
-			if (streamer && !streamer->isFinished()) {
+			if (streamer && !streamer->isFinished() && !cb->stopping) {
 				while (switch_core_media_bug_read(bug, &frame, SWITCH_TRUE) == SWITCH_STATUS_SUCCESS && !switch_test_flag((&frame), SFF_CNG)) {
 					if (frame.datalen) {
 						spx_int16_t out[SWITCH_RECOMMENDED_BUFFER_SIZE];

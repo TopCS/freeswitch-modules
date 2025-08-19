@@ -71,6 +71,53 @@ Prints the module version, git hash, build date and build type, e.g.:
 * `dialogflow::transfer` - module is about to transfer the call; JSON body includes `exten`, `context`, `dialplan`, `intent_display_name`. Also includes `parameters` (from Dialogflow QueryResult) and, when enabled, `query_params`.
 * `dialogflow::end_session` - module is about to end the session; JSON body includes `intent_display_name`. Also includes `parameters` (from Dialogflow QueryResult) and, when enabled, `query_params`.
 
+### Event Payloads
+- The event body is a flat JSON string (not nested). For compatibility, the same JSON is also included as header `Response` on events emitted by this module.
+- All events include DF-* headers for quick filtering: `DF-Session-Path`, `DF-Session-Id`, `DF-Project`, `DF-Agent`, `DF-Region`, `DF-Environment`, `DF-Channel`, `DF-Response-Id`, `DF-Intent`, `DF-Page` (and for audio suppression `DF-Audio-Path`).
+
+- `dialogflow::intent`
+  - Body: `{ response_id, query_result, [query_params] }`
+  - `query_result`: `{ intent:{name,display_name}, language_code, [current_page:{name,display_name}], [parameters:{}], [diagnostic_info:{}], [turn_timing:{ total_ms, asr_ms, post_asr_ms }] }`
+  - When `DIALOGFLOW_INCLUDE_QUERY_PARAMS=true`, `query_params` contains `{ channel, payload }`.
+
+- `dialogflow::transcription`
+  - Body: `{ recognition_result:{ transcript, is_final, message_type }, [query_params] }`
+  - On final transcripts, `turn_timing` may be included when `DIALOGFLOW_INCLUDE_DIAGNOSTIC_INFO=true`.
+
+- `dialogflow::end_of_utterance`
+  - Body: `{ recognition_result:{ message_type:"END_OF_SINGLE_UTTERANCE", is_final:false, transcript:"" } }`
+
+- `dialogflow::audio_provided`
+  - Default body: `{ path:"/tmp/....wav|.mp3|.opus" }`
+  - If `DIALOGFLOW_SUPPRESS_AUDIO_EVENT_BODY=true`: body is `{}` and header `DF-Audio-Path` carries the path.
+
+- `dialogflow::error`
+  - Body: `{ msg, code, category, retryable, [details] }`
+  - `category`: one of `auth|quota|network|timeout|server|unknown`.
+
+- `dialogflow::webhook_error`
+  - Body: `{ index, code, message, category, retryable, [diagnostic_info], [query_params], [intent_display_name], [page_display_name] }`
+
+- `dialogflow::transfer`
+  - Body: `{ exten, context, dialplan, intent_display_name, [page_display_name], [parameters], [query_params] }`
+
+- `dialogflow::end_session`
+  - Body: `{ intent_display_name, [page_display_name], [parameters], [query_params] }`
+
+Parsing tip (JS):
+```
+let payload;
+if (typeof data?.body === 'string' && data.body.trim().startsWith('{')) {
+  payload = JSON.parse(data.body);
+} else if (data?.body?.response) {
+  payload = JSON.parse(data.body.response);
+} else if (typeof data?.data === 'string' && data.data.trim().startsWith('{')) {
+  payload = JSON.parse(data.data);
+} else {
+  // no JSON payload found
+}
+```
+
 ### Dialplan Variables
 - `DIALOGFLOW_CHANNEL`: Optional logical channel name to set `QueryParameters.channel` and include in parameters.
 - `DIALOGFLOW_PARAMS`: Optional JSON string merged into `QueryParameters.parameters` on start.
@@ -90,7 +137,8 @@ Prints the module version, git hash, build date and build type, e.g.:
 - `DIALOGFLOW_OUTPUT_ENCODING`: One of `wav|mp3|opus`. Requests the given output audio encoding (default `wav` i.e., LINEAR16).
 - `DIALOGFLOW_SUPPRESS_AUDIO_EVENT_BODY`: When `true`, `dialogflow::audio_provided` will not include a JSON body; the audio file path is provided in the `DF-Audio-Path` event header instead.
 - `DIALOGFLOW_EMIT_WEBHOOK_ERRORS`: When `true` (default), emit `dialogflow::webhook_error` events when Dialogflow reports webhook failures in `QueryResult.webhook_statuses` (and attach `diagnostic_info` when available). Set to `false` to suppress.
- - `DIALOGFLOW_INCLUDE_DIAGNOSTIC_INFO`: When `true` (default), include `query_result.diagnostic_info` and `turn_timing` in `dialogflow::intent` events (and for final `dialogflow::transcription`).
+ - `DIALOGFLOW_INCLUDE_DIAGNOSTIC_INFO`: When `true` (default), include `query_result.diagnostic_info` in `dialogflow::intent` events.
+ - `DIALOGFLOW_INCLUDE_TURN_TIMING`: When `true` (default), include `turn_timing` in `dialogflow::intent` events (and for final `dialogflow::transcription`).
  - `DIALOGFLOW_LOG_TURN_TIMING`: When `true`, log coarse turn timing at INFO level on final transcription/intent (e.g., `total=... asr=... post_asr=...`).
 
 - `DIALOGFLOW_PASS_ALL_CHANNEL_VARS`: When `true`, include all channel variables as string `QueryParameters.parameters`.

@@ -29,8 +29,7 @@ if [[ -d "$FS_PREFIX" ]]; then
     -e PKG_CONFIG_PATH=/usr/local/freeswitch/lib/pkgconfig:${PKG_CONFIG_PATH:-}
   )
 fi
-docker run "${RUN_ARGS[@]}" "$IMAGE_NAME" bash -lc "scripts/build-deb.sh /gens $BUILD_DIR"
+docker run "${RUN_ARGS[@]}" "$IMAGE_NAME" bash -lc "CMAKE_ARGS='-DCMAKE_CXX_STANDARD=14 -DBUNDLE_GRPC_DEPS=ON' scripts/build-deb.sh /gens $BUILD_DIR"
 
 echo "\nDone. Artifacts in $BUILD_DIR/ :"
 ls -1 "$BUILD_DIR"/*.deb || true
-

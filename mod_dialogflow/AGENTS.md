@@ -38,6 +38,18 @@
   - `git add <files>`
   - `git commit -m "<area>: <breve descrizione>"`
 
+## Build Pacchetto .deb con Docker
+- Requisiti: Docker, generati Google APIs C++ (GENS_DIR).
+- Comando unico:
+  - `GENS_DIR=/abs/path/to/gens scripts/docker-build-deb.sh`
+- Cosa fa:
+  - Costruisce l’immagine Debian builder (`mod-dialogflow-deb:bookworm`).
+  - Esegue il packaging dentro il container usando `scripts/build-deb.sh`.
+  - Gli artifact `.deb` vengono scritti nella directory `build/` del repo (bind mount).
+- Esecuzione manuale (alternativa):
+  - `docker build -t mod-dialogflow-deb:bookworm -f Dockerfile.debian .`
+  - `docker run --rm -v "$PWD":/src -v "$GENS_DIR":/gens -w /src mod-dialogflow-deb:bookworm bash -lc 'scripts/build-deb.sh /gens build'`
+
 ## Commits & Pull Requests
 - Commits: small, focused, and descriptive (scope: area, e.g., "parser:"). Reference issues when available.
 - PRs: include a clear summary, steps to reproduce/verify, config notes (e.g., `GENS_DIR`, credentials), and any logs/events screenshots. Avoid adding new dependencies without discussion.

@@ -18,7 +18,7 @@ if [[ ! -d "${GENS_DIR}/google" ]]; then
   exit 2
 fi
 
-cmake -S . -B "${BUILD_DIR}" -DGENS_DIR="${GENS_DIR}" -DCMAKE_BUILD_TYPE=Release
+cmake -S . -B "${BUILD_DIR}" -DGENS_DIR="${GENS_DIR}" -DCMAKE_BUILD_TYPE=Release -DFS_MOD_DIR=/usr/lib/freeswitch/mod ${CMAKE_ARGS:-}
 cmake --build "${BUILD_DIR}" -j"${JOBS}"
 cmake --install "${BUILD_DIR}" --component mod_dialogflow || true
 
