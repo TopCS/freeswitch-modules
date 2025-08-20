@@ -70,6 +70,7 @@ Prints the module version, git hash, build date and build type, e.g.:
   - For `dialogflow::intent` events, when available and enabled, the module also includes `query_result.diagnostic_info` and a `turn_timing` object with coarse timings: `total_ms`, `asr_ms` (from turn start to final transcript/EOU), and `post_asr_ms` (from final transcript/EOU to DetectIntentResponse). These are best-effort client-side measurements, not server-provided breakdowns.
 * `dialogflow::transfer` - module is about to transfer the call; JSON body includes `exten`, `context`, `dialplan`, `intent_display_name`. Also includes `parameters` (from Dialogflow QueryResult) and, when enabled, `query_params`.
 * `dialogflow::end_session` - module is about to end the session; JSON body includes `intent_display_name`. Also includes `parameters` (from Dialogflow QueryResult) and, when enabled, `query_params`.
+* `dialogflow::page` - emitted when the agent enters a new `current_page`. JSON body includes `page_display_name`, `page_name` (resource when available), and `parameters` (from QueryResult). Includes `query_params` when enabled.
 
 ### Event Payloads
 - The event body is a flat JSON string (not nested). For compatibility, the same JSON is also included as header `Response` on events emitted by this module.
@@ -138,7 +139,7 @@ if (typeof data?.body === 'string' && data.body.trim().startsWith('{')) {
 - `DIALOGFLOW_SUPPRESS_AUDIO_EVENT_BODY`: When `true`, `dialogflow::audio_provided` will not include a JSON body; the audio file path is provided in the `DF-Audio-Path` event header instead.
 - `DIALOGFLOW_EMIT_WEBHOOK_ERRORS`: When `true` (default), emit `dialogflow::webhook_error` events when Dialogflow reports webhook failures in `QueryResult.webhook_statuses` (and attach `diagnostic_info` when available). Set to `false` to suppress.
  - `DIALOGFLOW_INCLUDE_DIAGNOSTIC_INFO`: When `true` (default), include `query_result.diagnostic_info` in `dialogflow::intent` events.
- - `DIALOGFLOW_INCLUDE_TURN_TIMING`: When `true` (default), include `turn_timing` in `dialogflow::intent` events (and for final `dialogflow::transcription`).
+- `DIALOGFLOW_INCLUDE_TURN_TIMING`: When `true` (default), include `turn_timing` in `dialogflow::intent` events (and for final `dialogflow::transcription`).
  - `DIALOGFLOW_LOG_TURN_TIMING`: When `true`, log coarse turn timing at INFO level on final transcription/intent (e.g., `total=... asr=... post_asr=...`).
 
 - `DIALOGFLOW_PASS_ALL_CHANNEL_VARS`: When `true`, include all channel variables as string `QueryParameters.parameters`.

@@ -938,10 +938,53 @@ static void *SWITCH_THREAD_FUNC grpc_read_thread(switch_thread_t *thread, void *
                     if (!disp.empty()) switch_channel_set_variable(channel, "DF_INTENT", disp.c_str());
                     std::string Udisp = toUpper(disp);
                     std::string page_disp;
+                    std::string page_name;
                     if (qr.has_current_page()) {
                         page_disp = qr.current_page().display_name();
+                        page_name = qr.current_page().name();
                     }
-                    if (!page_disp.empty()) switch_channel_set_variable(channel, "DF_PAGE", page_disp.c_str());
+                    // Detect page change by resource name (preferred) or display name
+                    if (!page_disp.empty() || !page_name.empty()) {
+                        const char* prev_name = switch_channel_get_variable(channel, "DF_PAGE_NAME");
+                        const char* prev_page = switch_channel_get_variable(channel, "DF_PAGE");
+                        bool changed = false;
+                        if (!page_name.empty()) {
+                            changed = (!prev_name || strcmp(prev_name, page_name.c_str()) != 0);
+                        } else {
+                            changed = (!prev_page || strcasecmp(prev_page, page_disp.c_str()) != 0);
+                        }
+                        if (changed) {
+                            cJSON* j = cJSON_CreateObject();
+                            // Include both resource name and display name when possible
+                            if (!page_name.empty()) cJSON_AddItemToObject(j, "page_name", cJSON_CreateString(page_name.c_str()));
+                            cJSON_AddItemToObject(j, "page_display_name", cJSON_CreateString(page_disp.c_str()));
+                            // Include page parameters when available (from QueryResult)
+                            if (qr.has_parameters()) {
+                                cJSON* jp = parser.parseStruct(qr.parameters());
+                                cJSON_AddItemToObject(j, "parameters", jp);
+                            }
+                            // Optionally include request query_params
+                            bool include_qp = switch_true(switch_channel_get_variable(channel, "DIALOGFLOW_INCLUDE_QUERY_PARAMS"));
+                            if (include_qp) {
+                                cJSON* jq = cJSON_CreateObject();
+                                if (!streamer->qpChannel().empty()) {
+                                    cJSON_AddItemToObject(jq, "channel", cJSON_CreateString(streamer->qpChannel().c_str()));
+                                }
+                                if (!streamer->requestParamsJSON().empty()) {
+                                    cJSON* pl = cJSON_Parse(streamer->requestParamsJSON().c_str());
+                                    if (pl) cJSON_AddItemToObject(jq, "payload", pl);
+                                    else cJSON_AddItemToObject(jq, "payload", cJSON_CreateString(streamer->requestParamsJSON().c_str()));
+                                }
+                                cJSON_AddItemToObject(j, "query_params", jq);
+                            }
+                            char* body = cJSON_PrintUnformatted(j);
+                            cb->responseHandler(psession, DIALOGFLOW_EVENT_PAGE, body);
+                            free(body);
+                            cJSON_Delete(j);
+                        }
+                        if (!page_disp.empty()) switch_channel_set_variable(channel, "DF_PAGE", page_disp.c_str());
+                        if (!page_name.empty()) switch_channel_set_variable(channel, "DF_PAGE_NAME", page_name.c_str());
+                    }
                     std::string Upage = toUpper(page_disp);
 
                     // Optionally emit webhook error events based on QueryResult.webhook_statuses / diagnostic_info
