@@ -17,6 +17,8 @@
 #include <sstream>
 #include <map>
 #include <set>
+#include <thread>
+#include <chrono>
 
 #include "google/cloud/dialogflow/cx/v3/session.grpc.pb.h"
 
@@ -945,6 +947,9 @@ static void *SWITCH_THREAD_FUNC grpc_read_thread(switch_thread_t *thread, void *
                     }
                     // Detect page change by resource name (preferred) or display name
                     if (!page_disp.empty() || !page_name.empty()) {
+                        // Toggle via DIALOGFLOW_EMIT_PAGE (default: true)
+                        const char* pgVar = switch_channel_get_variable(channel, "DIALOGFLOW_EMIT_PAGE");
+                        bool emit_page = (pgVar == NULL) ? true : switch_true(pgVar);
                         const char* prev_name = switch_channel_get_variable(channel, "DF_PAGE_NAME");
                         const char* prev_page = switch_channel_get_variable(channel, "DF_PAGE");
                         bool changed = false;
@@ -953,7 +958,7 @@ static void *SWITCH_THREAD_FUNC grpc_read_thread(switch_thread_t *thread, void *
                         } else {
                             changed = (!prev_page || strcasecmp(prev_page, page_disp.c_str()) != 0);
                         }
-                        if (changed) {
+                        if (changed && emit_page) {
                             cJSON* j = cJSON_CreateObject();
                             // Include both resource name and display name when possible
                             if (!page_name.empty()) cJSON_AddItemToObject(j, "page_name", cJSON_CreateString(page_name.c_str()));
@@ -1494,9 +1499,30 @@ extern "C" {
 			struct cap_cb *cb = (struct cap_cb *) switch_core_media_bug_get_user_data(bug);
 			switch_status_t st;
 
-			// Best-effort: stop any ongoing synchronous playback immediately via uuid_break
-			switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "google_dialogflow_session_cleanup: requesting stop of any ongoing playback (uuid_break)\n");
-			{
+			// Behavior: optionally wait for sync playback to finish instead of breaking
+			const char* waitVar = switch_channel_get_variable(channel, "DIALOGFLOW_STOP_WAIT_PLAYBACK");
+			bool wait_playback = (waitVar == NULL) ? true : switch_true(waitVar);
+			if (wait_playback) {
+				const char* tv = switch_channel_get_variable(channel, "DIALOGFLOW_STOP_WAIT_TIMEOUT_MS");
+				int timeout_ms = tv ? atoi(tv) : 10000;
+				int waited = 0;
+				bool paused = false;
+				do {
+					// Sample paused state without holding lock for long
+					switch_mutex_lock(cb->mutex);
+					GStreamer* streamer = (GStreamer *) cb->streamer;
+					paused = (streamer && streamer->isPaused());
+					switch_mutex_unlock(cb->mutex);
+					if (!paused) break;
+					std::this_thread::sleep_for(std::chrono::milliseconds(50));
+					waited += 50;
+				} while (waited < timeout_ms);
+				switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG,
+					"google_dialogflow_session_cleanup: playback %s after waiting %dms\n",
+					paused ? "still active" : "finished", waited);
+			} else {
+				// Best-effort: stop any ongoing synchronous playback immediately via uuid_break
+				switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "google_dialogflow_session_cleanup: requesting stop of any ongoing playback (uuid_break)\n");
 				const char* suuid = switch_core_session_get_uuid(session);
 				char args[256]; snprintf(args, sizeof(args), "%s all", suuid ? suuid : "");
 				switch_stream_handle_t stream = { 0 }; SWITCH_STANDARD_STREAM(stream);

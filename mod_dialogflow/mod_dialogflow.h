@@ -16,6 +16,8 @@
 #define DIALOGFLOW_EVENT_END_SESSION "dialogflow::end_session"
 // Emitted when Dialogflow CX reports webhook failures inside QueryResult
 #define DIALOGFLOW_EVENT_WEBHOOK_ERROR "dialogflow::webhook_error"
+// Emitted when QueryResult.current_page indicates entry into a new page
+#define DIALOGFLOW_EVENT_PAGE "dialogflow::page"
 
 #define MAX_LANG (12)
 #define MAX_PROJECT_ID (128)
