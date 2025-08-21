@@ -142,6 +142,8 @@ if (typeof data?.body === 'string' && data.body.trim().startsWith('{')) {
  - `DIALOGFLOW_INCLUDE_TURN_TIMING`: When `true` (default), include `turn_timing` in `dialogflow::intent` events (and for final `dialogflow::transcription`).
  - `DIALOGFLOW_LOG_TURN_TIMING`: When `true`, log coarse turn timing at INFO level on final transcription/intent (e.g., `total=... asr=... post_asr=...`).
  - `DIALOGFLOW_EMIT_PAGE`: When `true` (default), emit `dialogflow::page` on page changes.
+ - `DIALOGFLOW_STOP_WAIT_PLAYBACK`: When `true` (default), `dialogflow_stop` waits for any in-progress synchronous autoplay to finish before closing the DF session; when `false`, it immediately breaks playback.
+ - `DIALOGFLOW_STOP_WAIT_TIMEOUT_MS`: Integer; maximum time (ms) to wait for playback to finish when the above is enabled. Default: `10000`.
 
 - `DIALOGFLOW_PASS_ALL_CHANNEL_VARS`: When `true`, include all channel variables as string `QueryParameters.parameters`.
 - `DIALOGFLOW_VAR_PREFIXES`: Optional comma-separated allowlist of prefixes to include when above is enabled (e.g., `sip_,caller_,origination_`).
