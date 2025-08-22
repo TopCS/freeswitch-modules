@@ -1071,7 +1071,7 @@ static void *SWITCH_THREAD_FUNC grpc_read_thread(switch_thread_t *thread, void *
                         switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(psession), SWITCH_LOG_NOTICE,
                             "DF END_SESSION match: intent='%s' page='%s' emit_only=%s\n",
                             disp.c_str(), page_disp.c_str(), emit_only ? "true" : "false");
-                        // Fire end_session event
+                        // Build end_session JSON body (may be deferred)
                         cJSON* j = cJSON_CreateObject();
                         cJSON_AddItemToObject(j, "intent_display_name", cJSON_CreateString(disp.c_str()));
                         if (!page_disp.empty()) cJSON_AddItemToObject(j, "page_display_name", cJSON_CreateString(page_disp.c_str()));
@@ -1095,14 +1095,19 @@ static void *SWITCH_THREAD_FUNC grpc_read_thread(switch_thread_t *thread, void *
                             cJSON_AddItemToObject(j, "query_params", jq);
                         }
                         char* body = cJSON_PrintUnformatted(j);
-                        switch_event_t* ev = nullptr;
-                        if (switch_event_create_subclass(&ev, SWITCH_EVENT_CUSTOM, DIALOGFLOW_EVENT_END_SESSION) == SWITCH_STATUS_SUCCESS) {
-                            switch_channel_event_set_data(channel, ev);
-                            switch_event_add_body(ev, "%s", body);
-                            switch_event_fire(&ev);
-                        }
-                        free(body);
                         cJSON_Delete(j);
+                        bool defer_end = switch_true(switch_channel_get_variable(channel, "DIALOGFLOW_END_SESSION_AFTER_PLAYBACK"))
+                                          && will_autoplay && autoplay_sync && dir.output_audio().size() > 0;
+                        if (defer_end) {
+                            switch_mutex_lock(cb->mutex);
+                            if (cb->pending_end_session_json) free(cb->pending_end_session_json);
+                            cb->pending_end_session_json = strdup(body);
+                            switch_mutex_unlock(cb->mutex);
+                            free(body);
+                        } else {
+                            cb->responseHandler(psession, DIALOGFLOW_EVENT_END_SESSION, body);
+                            free(body);
+                        }
                         if (!emit_only) {
                             // Stop DF session and hang up the call
                             google_dialogflow_session_stop(psession, 0);
@@ -1276,6 +1281,20 @@ static void *SWITCH_THREAD_FUNC grpc_read_thread(switch_thread_t *thread, void *
                         switch_status_t st = switch_ivr_play_file(psession, NULL, s.str().c_str(), NULL);
                         switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(psession), SWITCH_LOG_INFO,
                             "Auto-playing Dialogflow audio synchronously: %s (status=%d)\n", s.str().c_str(), st);
+                        // If we deferred end_session, emit it now on success
+                        const char* defer_end = switch_channel_get_variable(channel, "DIALOGFLOW_END_SESSION_AFTER_PLAYBACK");
+                        if (st == SWITCH_STATUS_SUCCESS && defer_end && switch_true(defer_end)) {
+                            switch_mutex_lock(cb->mutex);
+                            if (cb->pending_end_session_json) {
+                                char* tmp = cb->pending_end_session_json;
+                                cb->pending_end_session_json = NULL;
+                                switch_mutex_unlock(cb->mutex);
+                                cb->responseHandler(psession, DIALOGFLOW_EVENT_END_SESSION, tmp);
+                                free(tmp);
+                            } else {
+                                switch_mutex_unlock(cb->mutex);
+                            }
+                        }
                         // Resume streaming and rotate to a fresh audio-configured stream for next user turn
                         if (!cb->stopping && switch_channel_ready(channel)) {
                             switch_mutex_lock(cb->mutex);

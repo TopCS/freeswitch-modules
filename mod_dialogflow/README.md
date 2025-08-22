@@ -141,7 +141,8 @@ if (typeof data?.body === 'string' && data.body.trim().startsWith('{')) {
  - `DIALOGFLOW_INCLUDE_DIAGNOSTIC_INFO`: When `true` (default), include `query_result.diagnostic_info` in `dialogflow::intent` events.
  - `DIALOGFLOW_INCLUDE_TURN_TIMING`: When `true` (default), include `turn_timing` in `dialogflow::intent` events (and for final `dialogflow::transcription`).
  - `DIALOGFLOW_LOG_TURN_TIMING`: When `true`, log coarse turn timing at INFO level on final transcription/intent (e.g., `total=... asr=... post_asr=...`).
- - `DIALOGFLOW_EMIT_PAGE`: When `true` (default), emit `dialogflow::page` on page changes.
+- `DIALOGFLOW_EMIT_PAGE`: When `true` (default), emit `dialogflow::page` on page changes.
+ - `DIALOGFLOW_END_SESSION_AFTER_PLAYBACK`: When `true`, if the DF turn includes `output_audio` and synchronous autoplay is enabled, defer `dialogflow::end_session` emission until playback completes; otherwise emit immediately.
  - `DIALOGFLOW_STOP_WAIT_PLAYBACK`: When `true` (default), `dialogflow_stop` waits for any in-progress synchronous autoplay to finish before closing the DF session; when `false`, it immediately breaks playback.
  - `DIALOGFLOW_STOP_WAIT_TIMEOUT_MS`: Integer; maximum time (ms) to wait for playback to finish when the above is enabled. Default: `10000`.
 

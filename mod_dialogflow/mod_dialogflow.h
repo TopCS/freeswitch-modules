@@ -39,6 +39,7 @@ struct cap_cb {
     char projectId[MAX_PROJECT_ID];
     uint64_t lastTranscriptMs;
     switch_bool_t stopping;
+    char* pending_end_session_json;
 
 };
 
