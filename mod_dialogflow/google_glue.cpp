@@ -1277,7 +1277,7 @@ static void *SWITCH_THREAD_FUNC grpc_read_thread(switch_thread_t *thread, void *
                         switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(psession), SWITCH_LOG_INFO,
                             "Auto-playing Dialogflow audio synchronously: %s (status=%d)\n", s.str().c_str(), st);
                         // Resume streaming and rotate to a fresh audio-configured stream for next user turn
-                        if (!cb->stopping) {
+                        if (!cb->stopping && switch_channel_ready(channel)) {
                             switch_mutex_lock(cb->mutex);
                             streamer->setPaused(false);
                             streamer->rotateToAudioConfig(psession);
@@ -1294,7 +1294,7 @@ static void *SWITCH_THREAD_FUNC grpc_read_thread(switch_thread_t *thread, void *
                             "Auto-playing Dialogflow audio via uuid_broadcast: %s (status=%d)\n", args, st);
                         switch_safe_free(stream.data);
                         // Rotate immediately to begin listening during async playback
-                        if (!cb->stopping) {
+                        if (!cb->stopping && switch_channel_ready(channel)) {
                             switch_mutex_lock(cb->mutex);
                             if (streamer->isPaused()) streamer->setPaused(false);
                             streamer->rotateToAudioConfig(psession);
@@ -1303,7 +1303,7 @@ static void *SWITCH_THREAD_FUNC grpc_read_thread(switch_thread_t *thread, void *
                     }
                 } else {
                     // Not auto-playing here. If we paused earlier, resume and rotate now.
-                    if (!cb->stopping) {
+                    if (!cb->stopping && switch_channel_ready(channel)) {
                         switch_mutex_lock(cb->mutex);
                         if (streamer->isPaused()) streamer->setPaused(false);
                         streamer->rotateToAudioConfig(psession);
