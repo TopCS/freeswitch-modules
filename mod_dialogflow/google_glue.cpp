@@ -38,6 +38,7 @@ using google::cloud::dialogflow::cx::v3::StreamingRecognitionResult;
 using google::cloud::dialogflow::cx::v3::EventInput;
 using google::cloud::dialogflow::cx::v3::OutputAudioEncoding;
 using google::cloud::dialogflow::cx::v3::SsmlVoiceGender;
+using google::cloud::dialogflow::cx::v3::QueryParameters;
 using google::rpc::Status;
 using google::protobuf::Struct;
 using google::protobuf::Value;
@@ -167,7 +168,66 @@ static cJSON* collectChannelVarsAsJSON(switch_core_session_t* session) {
         }
         switch_event_destroy(&ev);
     }
+    if (root && root->child) {
+        char* dump = cJSON_PrintUnformatted(root);
+        if (dump) {
+            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG,
+                "collectChannelVarsAsJSON gathered %d entries: %s\n", cJSON_GetArraySize(root), dump);
+            cJSON_free(dump);
+        } else {
+            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG,
+                "collectChannelVarsAsJSON gathered %d entries (unable to serialize)\n", cJSON_GetArraySize(root));
+        }
+    } else {
+        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG,
+            "collectChannelVarsAsJSON no channel vars eligible for injection\n");
+    }
     return root;
+}
+
+static void logMergedParamsJSON(switch_core_session_t* session, const char* label, cJSON* json) {
+    if (!json) {
+        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG,
+            "%s: <null JSON>\n", label);
+        return;
+    }
+    char* dump = cJSON_PrintUnformatted(json);
+    if (dump) {
+        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG,
+            "%s: %s\n", label, dump);
+        cJSON_free(dump);
+    } else {
+        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG,
+            "%s: <unable to serialize JSON>\n", label);
+    }
+}
+
+static void logQueryParamsSummary(switch_core_session_t* session, const char* label, const QueryParameters& qp) {
+    const auto& fields = qp.parameters().fields();
+    std::ostringstream keys;
+    bool first = true;
+    for (const auto& kv : fields) {
+        if (!first) keys << ",";
+        keys << kv.first;
+        first = false;
+    }
+    std::string keyList = keys.str();
+    const std::string& channel = qp.channel();
+    switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG,
+        "%s channel='%s' field_count=%lu fields=[%s]\n",
+        label,
+        channel.empty() ? "<unset>" : channel.c_str(),
+        (unsigned long)fields.size(),
+        keyList.empty() ? "<none>" : keyList.c_str());
+}
+
+static void addOrReplaceJSONField(cJSON* target, const char* key, cJSON* value) {
+    if (!target || !key || !value) {
+        if (value) cJSON_Delete(value);
+        return;
+    }
+    cJSON_DeleteItemFromObjectCaseSensitive(target, key);
+    cJSON_AddItemToObject(target, key, value);
 }
 
 void tokenize(std::string const &str, const char delim, std::vector<std::string> &out) {
@@ -341,9 +401,10 @@ public:
             if (text) {
                 cJSON* json = cJSON_Parse(text);
                 if (json) {
+                    logMergedParamsJSON(session, "GStreamer::startStream event payload JSON", json);
                     have_params = true;
                     for (cJSON* it = json->child; it; it = it->next) {
-                        cJSON_ReplaceItemInObject(root, it->string, cJSON_Duplicate(it, 1));
+                        addOrReplaceJSONField(root, it->string, cJSON_Duplicate(it, 1));
                     }
                     cJSON_Delete(json);
                 } else {
@@ -355,6 +416,8 @@ public:
                 // Set top-level QueryParameters.channel
                 m_request->mutable_query_params()->set_channel(ch);
                 m_qpChannel = ch;
+                switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG,
+                    "GStreamer::startStream applying DIALOGFLOW_CHANNEL='%s' to QueryParameters\n", ch);
                 // Also include in parameters for agent usage if desired
                 have_params = true;
                 cJSON_AddItemToObject(root, "channel", cJSON_CreateString(ch));
@@ -363,6 +426,7 @@ public:
             if (js && *js) {
                 cJSON* json = cJSON_Parse(js);
                 if (json) {
+                    logMergedParamsJSON(session, "GStreamer::startStream DIALOGFLOW_PARAMS JSON", json);
                     // Remember original request params JSON for event echoing
                     m_requestParamsJSON = js;
                     have_params = true;
@@ -373,7 +437,7 @@ public:
                         m_qpChannel = chv->valuestring;
                     }
                     for (cJSON* it = json->child; it; it = it->next) {
-                        cJSON_ReplaceItemInObject(root, it->string, cJSON_Duplicate(it, 1));
+                        addOrReplaceJSONField(root, it->string, cJSON_Duplicate(it, 1));
                     }
                     cJSON_Delete(json);
                 } else {
@@ -384,11 +448,12 @@ public:
             if (cJSON* chvars = collectChannelVarsAsJSON(session)) {
                 have_params = true;
                 for (cJSON* it = chvars->child; it; it = it->next) {
-                    cJSON_ReplaceItemInObject(root, it->string, cJSON_Duplicate(it, 1));
+                    addOrReplaceJSONField(root, it->string, cJSON_Duplicate(it, 1));
                 }
                 cJSON_Delete(chvars);
             }
             if (have_params) {
+                logMergedParamsJSON(session, "GStreamer::startStream merged parameters JSON (event)", root);
                 auto* qp = m_request->mutable_query_params();
                 auto* params = qp->mutable_parameters();
                 parseEventParams(params, root);
@@ -401,6 +466,7 @@ public:
             if (text[0] == '{') {
                 cJSON* json = cJSON_Parse(text);
                 if (json) {
+                    logMergedParamsJSON(session, "GStreamer::startStream text payload JSON", json);
                     auto* qp = m_request->mutable_query_params();
                     auto* params = qp->mutable_parameters();
                     parseEventParams(params, json);
@@ -429,6 +495,8 @@ public:
                     queryInput->set_language_code(m_lang.c_str());
                     // Start next turn in audio mode after sending a plain text input
                     m_needConfig.store(true);
+                    switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG,
+                        "GStreamer::startStream initial request uses plain text input (no JSON)\n");
                 }
             } else {
                 auto* textInput = queryInput->mutable_text();
@@ -436,6 +504,8 @@ public:
                 queryInput->set_language_code(m_lang.c_str());
                 // Start next turn in audio mode after sending a plain text input
                 m_needConfig.store(true);
+                switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG,
+                    "GStreamer::startStream initial request uses plain text input\n");
                 // Optionally inject channel variables alongside plain text
                 if (cJSON* chvars = collectChannelVarsAsJSON(session)) {
                     auto* qp = m_request->mutable_query_params();
@@ -451,11 +521,14 @@ public:
             if (ch && *ch) {
                 m_request->mutable_query_params()->set_channel(ch);
                 m_qpChannel = ch;
+                switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG,
+                    "GStreamer::startStream applying DIALOGFLOW_CHANNEL='%s' to QueryParameters\n", ch);
             }
             const char* js = switch_channel_get_variable(channel, "DIALOGFLOW_PARAMS");
             if (js && *js) {
                 cJSON* json2 = cJSON_Parse(js);
                 if (json2) {
+                    logMergedParamsJSON(session, "GStreamer::startStream DIALOGFLOW_PARAMS JSON", json2);
                     m_requestParamsJSON = js;
                     cJSON* chv2 = cJSON_GetObjectItemCaseSensitive(json2, "channel");
                     if (cJSON_IsString(chv2) && chv2->valuestring && chv2->valuestring[0]) {
@@ -483,6 +556,7 @@ public:
                 cJSON_Delete(chvars);
             }
         }
+        logQueryParamsSummary(session, "GStreamer::startStream final QueryParameters state", m_request->query_params());
         switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "GStreamer::startStream requesting OutputAudio in LINEAR16 @%uHz; custom params? %s\n",
                           (unsigned)m_sampleRate, isAnyOutputAudioConfigChanged() ? "yes" : "no");
         auto* outputAudioConfig = m_request->mutable_output_audio_config();
