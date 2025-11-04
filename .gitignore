@@ -31,14 +31,23 @@
 *.out
 *.app
 
+*.gz
+*.zip
+*.deb
+
+
+
 # CMake build files
 CMakeFiles/
 CMakeCache.txt
 cmake_install.cmake
 Makefile
 build/
+build-deb/
+build-stretch/
 _deps/
 Testing/
 CTestTestfile.cmake
 install_manifest.txt
 compile_commands.json
+.libs/

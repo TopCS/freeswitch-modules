@@ -6,5 +6,5 @@ Package: freeswitch-mod-dialogflow
 Priority: optional
 Section: net
 Version: 1.0.0
-Installed-Size: 58087
+Installed-Size: 57576
 

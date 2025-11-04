@@ -33,9 +33,9 @@ endif()
 
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(FreeSWITCH REQUIRED IMPORTED_TARGET freeswitch)
-pkg_check_modules(GRPCPP REQUIRED IMPORTED_TARGET grpc++)
-pkg_check_modules(GRPC REQUIRED IMPORTED_TARGET grpc)
-pkg_check_modules(Protobuf REQUIRED IMPORTED_TARGET protobuf)
+pkg_check_modules(GRPCPP REQUIRED grpc++)
+pkg_check_modules(GRPC REQUIRED grpc)
+pkg_check_modules(Protobuf REQUIRED protobuf)
 pkg_check_modules(SPEEXDSP REQUIRED speexdsp)
 
 # Determine FreeSWITCH modules installation directory from override or pkg-config
@@ -76,12 +76,26 @@ target_compile_definitions(mod_dialogflow PRIVATE
   MOD_DIALOGFLOW_GIT_HASH="${GIT_HASH}"
   MOD_DIALOGFLOW_BUILD_TYPE="$<CONFIG>"
 )
+
 target_include_directories(mod_dialogflow PRIVATE
   ${GENS_DIR}
+  ${GRPCPP_INCLUDE_DIRS}
+  ${GRPC_INCLUDE_DIRS}
+  ${Protobuf_INCLUDE_DIRS}
+  ${SPEEXDSP_INCLUDE_DIRS}
+  ${CMAKE_CURRENT_BINARY_DIR}
 )
 
-# Make generated headers (build_info.h) visible
-target_include_directories(mod_dialogflow PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
+set(_mod_dialogflow_link_dirs
+  ${GRPCPP_LIBRARY_DIRS}
+  ${GRPC_LIBRARY_DIRS}
+  ${Protobuf_LIBRARY_DIRS}
+  ${SPEEXDSP_LIBRARY_DIRS}
+)
+list(REMOVE_DUPLICATES _mod_dialogflow_link_dirs)
+if(_mod_dialogflow_link_dirs)
+  target_link_directories(mod_dialogflow PRIVATE ${_mod_dialogflow_link_dirs})
+endif()
 
 # Generate build_info.h at build time with a fresh timestamp (and git hash)
 add_custom_target(gen_build_info ALL
@@ -100,18 +114,21 @@ foreach(src ${GENS_SOURCES})
   set_source_files_properties(${src} PROPERTIES COMPILE_FLAGS "-Wno-deprecated-declarations -Wno-unused-parameter")
 endforeach()
 
-target_include_directories(mod_dialogflow PRIVATE ${SPEEXDSP_INCLUDE_DIRS})
 target_link_libraries(mod_dialogflow PRIVATE
   PkgConfig::FreeSWITCH
-  PkgConfig::GRPCPP
-  PkgConfig::GRPC
-  PkgConfig::Protobuf
+  ${GRPCPP_LIBRARIES}
+  ${GRPC_LIBRARIES}
+  ${Protobuf_LIBRARIES}
   ${SPEEXDSP_LIBRARIES}
   pthread
 )
 
-# Append any extra linker flags from pkg-config for speexdsp
-target_link_options(mod_dialogflow PRIVATE ${SPEEXDSP_LDFLAGS_OTHER})
+target_link_options(mod_dialogflow PRIVATE
+  ${GRPCPP_LDFLAGS_OTHER}
+  ${GRPC_LDFLAGS_OTHER}
+  ${Protobuf_LDFLAGS_OTHER}
+  ${SPEEXDSP_LDFLAGS_OTHER}
+)
 
 install(TARGETS mod_dialogflow DESTINATION ${FS_MOD_DIR})
 
