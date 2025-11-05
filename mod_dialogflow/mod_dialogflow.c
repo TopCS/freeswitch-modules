@@ -6,10 +6,12 @@
 #include "mod_dialogflow.h"
 #include "google_glue.h"
 #include "build_info.h"
+#include <switch_json.h>
 
 #define DEFAULT_INTENT_TIMEOUT_SECS (30)
 #define DIALOGFLOW_INTENT "dialogflow_intent"
 #define DIALOGFLOW_INTENT_AUDIO_FILE "dialogflow_intent_audio_file"
+#define DIALOGFLOW_API_CAPTURE_SYNTAX "<uuid> <start_ms> <duration_ms> [tag]"
 
 #ifndef MOD_DIALOGFLOW_VERSION
 #define MOD_DIALOGFLOW_VERSION "unknown"
@@ -42,6 +44,8 @@ SWITCH_STANDARD_API(dialogflow_api_version_function)
     stream->write_function(stream, "%s\n", mod_dialogflow_version_str());
     return SWITCH_STATUS_SUCCESS;
 }
+
+SWITCH_STANDARD_API(dialogflow_api_capture_function);
 
 static void responseHandler(switch_core_session_t* session, const char * type, char * json) {
     switch_event_t *event;
@@ -238,6 +242,97 @@ SWITCH_STANDARD_API(dialogflow_api_start_function)
 	return SWITCH_STATUS_SUCCESS;	
 }
 
+#define MAX_CAPTURE_ARGS 5
+SWITCH_STANDARD_API(dialogflow_api_capture_function)
+{
+	char *mycmd = NULL, *argv[MAX_CAPTURE_ARGS] = { 0 };
+	int argc = 0;
+	switch_status_t status = SWITCH_STATUS_FALSE;
+
+	if (!zstr(cmd) && (mycmd = strdup(cmd))) {
+		argc = switch_separate_string(mycmd, ' ', argv, MAX_CAPTURE_ARGS);
+	}
+
+	if (zstr(cmd) || argc < 3) {
+		stream->write_function(stream, "-USAGE: %s\n", DIALOGFLOW_API_CAPTURE_SYNTAX);
+		goto done;
+	}
+
+	const char* uuid = argv[0];
+	uint64_t start_ms = (uint64_t) strtoull(argv[1], NULL, 10);
+	uint64_t duration_ms = (uint64_t) strtoull(argv[2], NULL, 10);
+	const char* tag = (argc >= 4 && !zstr(argv[3])) ? argv[3] : "snippet";
+
+	switch_core_session_t* lsession = switch_core_session_locate(uuid);
+	if (!lsession) {
+		stream->write_function(stream, "-ERR invalid uuid %s\n", uuid);
+		goto done;
+	}
+
+	switch_channel_t* channel = switch_core_session_get_channel(lsession);
+	switch_media_bug_t* bug = switch_channel_get_private(channel, MY_BUG_NAME);
+	if (!bug) {
+		stream->write_function(stream, "-ERR dialogflow not active on %s\n", uuid);
+		goto cleanup;
+	}
+
+	struct cap_cb* cb = (struct cap_cb*) switch_core_media_bug_get_user_data(bug);
+	if (!cb) {
+		stream->write_function(stream, "-ERR dialogflow session unavailable\n");
+		goto cleanup;
+	}
+
+	char path[MAX_PATHLEN] = {0};
+	uint64_t actual_start = 0;
+	uint64_t actual_end = 0;
+
+	status = google_dialogflow_capture_snippet(cb, lsession, start_ms, duration_ms, tag, path, sizeof(path), &actual_start, &actual_end);
+	if (status != SWITCH_STATUS_SUCCESS) {
+		stream->write_function(stream, "-ERR capture failed (spool disabled or window unavailable)\n");
+		goto cleanup;
+	}
+
+	cJSON* body = cJSON_CreateObject();
+	if (body) {
+		cJSON_AddStringToObject(body, "path", path);
+		cJSON_AddNumberToObject(body, "start_ms", (double)actual_start);
+		cJSON_AddNumberToObject(body, "end_ms", (double)actual_end);
+		cJSON_AddNumberToObject(body, "duration_ms", (double)((actual_end > actual_start) ? (actual_end - actual_start) : 0));
+		cJSON_AddStringToObject(body, "tag", tag);
+		cJSON_AddStringToObject(body, "session_id", uuid);
+		char* payload = cJSON_PrintUnformatted(body);
+		cJSON_Delete(body);
+
+		if (payload) {
+			switch_event_t* event;
+			switch_event_create_subclass(&event, SWITCH_EVENT_CUSTOM, DIALOGFLOW_EVENT_AUDIO_SNIPPET);
+			switch_channel_event_set_data(channel, event);
+			switch_event_add_header_string(event, SWITCH_STACK_BOTTOM, "Response", payload);
+			switch_event_add_header_string(event, SWITCH_STACK_BOTTOM, "DF-Audio-Path", path);
+			switch_event_add_body(event, "%s", payload);
+			switch_event_fire(&event);
+
+			stream->write_function(stream, "+OK %s\n", path);
+			free(payload);
+		} else {
+			stream->write_function(stream, "-ERR unable to allocate JSON payload\n");
+			status = SWITCH_STATUS_FALSE;
+			goto cleanup;
+		}
+	} else {
+		stream->write_function(stream, "-ERR unable to allocate JSON body\n");
+		status = SWITCH_STATUS_FALSE;
+		goto cleanup;
+	}
+
+cleanup:
+	switch_core_session_rwunlock(lsession);
+
+done:
+	switch_safe_free(mycmd);
+	return SWITCH_STATUS_SUCCESS;
+}
+
 #define DIALOGFLOW_API_STOP_SYNTAX "<uuid>"
 SWITCH_STANDARD_API(dialogflow_api_stop_function)
 {
@@ -286,6 +381,7 @@ static switch_bool_t g_reserved_transfer = SWITCH_FALSE;
 static switch_bool_t g_reserved_end_session = SWITCH_FALSE;
 static switch_bool_t g_reserved_webhook_error = SWITCH_FALSE;
 static switch_bool_t g_reserved_page = SWITCH_FALSE;
+static switch_bool_t g_reserved_audio_snippet = SWITCH_FALSE;
 
 SWITCH_MODULE_LOAD_FUNCTION(mod_dialogflow_load)
 {
@@ -308,6 +404,10 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_dialogflow_load)
 		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Couldn't register subclass %s!\n", DIALOGFLOW_EVENT_AUDIO_PROVIDED);
 		return SWITCH_STATUS_TERM;
 	} else g_reserved_audio = SWITCH_TRUE;
+	if (switch_event_reserve_subclass(DIALOGFLOW_EVENT_AUDIO_SNIPPET) != SWITCH_STATUS_SUCCESS) {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Couldn't register subclass %s!\n", DIALOGFLOW_EVENT_AUDIO_SNIPPET);
+		return SWITCH_STATUS_TERM;
+	} else g_reserved_audio_snippet = SWITCH_TRUE;
 
 	if (switch_event_reserve_subclass(DIALOGFLOW_EVENT_ERROR) != SWITCH_STATUS_SUCCESS) {
 		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Couldn't register subclass %s!\n", DIALOGFLOW_EVENT_ERROR);
@@ -347,6 +447,7 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_dialogflow_load)
     switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "Google Dialogflow API successfully loaded: %s\n", mod_dialogflow_version_str());
 
     SWITCH_ADD_API(api_interface, "dialogflow_start", "Start a google dialogflow", dialogflow_api_start_function, DIALOGFLOW_API_START_SYNTAX);
+    SWITCH_ADD_API(api_interface, "dialogflow_capture", "Capture a caller-side audio snippet for external ASR", dialogflow_api_capture_function, DIALOGFLOW_API_CAPTURE_SYNTAX);
     SWITCH_ADD_API(api_interface, "dialogflow_stop", "Terminate a google dialogflow", dialogflow_api_stop_function, DIALOGFLOW_API_STOP_SYNTAX);
     SWITCH_ADD_API(api_interface, "dialogflow_version", "Show mod_dialogflow version", dialogflow_api_version_function, "");
 
@@ -370,6 +471,7 @@ SWITCH_MODULE_SHUTDOWN_FUNCTION(mod_dialogflow_shutdown)
 	if (g_reserved_transcription) { switch_event_free_subclass(DIALOGFLOW_EVENT_TRANSCRIPTION); g_reserved_transcription = SWITCH_FALSE; }
 	if (g_reserved_eou) { switch_event_free_subclass(DIALOGFLOW_EVENT_END_OF_UTTERANCE); g_reserved_eou = SWITCH_FALSE; }
 	if (g_reserved_audio) { switch_event_free_subclass(DIALOGFLOW_EVENT_AUDIO_PROVIDED); g_reserved_audio = SWITCH_FALSE; }
+	if (g_reserved_audio_snippet) { switch_event_free_subclass(DIALOGFLOW_EVENT_AUDIO_SNIPPET); g_reserved_audio_snippet = SWITCH_FALSE; }
 	if (g_reserved_error) { switch_event_free_subclass(DIALOGFLOW_EVENT_ERROR); g_reserved_error = SWITCH_FALSE; }
 	if (g_reserved_transfer) { switch_event_free_subclass(DIALOGFLOW_EVENT_TRANSFER); g_reserved_transfer = SWITCH_FALSE; }
 	if (g_reserved_end_session) { switch_event_free_subclass(DIALOGFLOW_EVENT_END_SESSION); g_reserved_end_session = SWITCH_FALSE; }

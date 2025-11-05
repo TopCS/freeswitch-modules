@@ -18,10 +18,12 @@
 #define DIALOGFLOW_EVENT_WEBHOOK_ERROR "dialogflow::webhook_error"
 // Emitted when QueryResult.current_page indicates entry into a new page
 #define DIALOGFLOW_EVENT_PAGE "dialogflow::page"
+// Emitted when a stored audio snippet is made available for external ASR
+#define DIALOGFLOW_EVENT_AUDIO_SNIPPET "dialogflow::audio_snippet"
 
 #define MAX_LANG (12)
 #define MAX_PROJECT_ID (128)
-#define MAX_PATHLEN (256)
+#define MAX_PATHLEN (512)
 
 /* per-channel data */
 typedef void (*responseHandler_t)(switch_core_session_t* session, const char * type, char* json);

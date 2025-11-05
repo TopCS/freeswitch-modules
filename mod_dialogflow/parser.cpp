@@ -1,10 +1,17 @@
 #include "parser.h"
 #include <switch.h>
+#include "google/protobuf/duration.pb.h"
 
 using namespace google::protobuf;
 
 static cJSON* json_string(const std::string& s) {
     return cJSON_CreateString(s.c_str());
+}
+
+static double duration_to_ms(const Duration& d) {
+    double ms = static_cast<double>(d.seconds()) * 1000.0;
+    ms += static_cast<double>(d.nanos()) / 1000000.0;
+    return ms;
 }
 
 const std::string& GRPCParser::parseAudio(const dfx::StreamingDetectIntentResponse& response) {
@@ -25,6 +32,28 @@ cJSON* GRPCParser::parse(const dfx::StreamingDetectIntentResponse& response) {
         cJSON_AddItemToObject(jrr, "transcript", json_string(rr.transcript()));
         cJSON_AddItemToObject(jrr, "is_final", cJSON_CreateBool(rr.is_final()));
         cJSON_AddItemToObject(jrr, "message_type", json_string(dfx::StreamingRecognitionResult::MessageType_Name(rr.message_type())));
+        float rr_conf = rr.confidence();
+        if (rr_conf > 0.0f) {
+            cJSON_AddItemToObject(jrr, "confidence", cJSON_CreateNumber(rr_conf));
+        }
+        if (rr.speech_word_info_size() > 0) {
+            cJSON* words = cJSON_CreateArray();
+            for (const auto& info : rr.speech_word_info()) {
+                cJSON* jw = cJSON_CreateObject();
+                cJSON_AddItemToObject(jw, "word", json_string(info.word()));
+                if (info.has_start_offset()) {
+                    cJSON_AddItemToObject(jw, "start_ms", cJSON_CreateNumber(duration_to_ms(info.start_offset())));
+                }
+                if (info.has_end_offset()) {
+                    cJSON_AddItemToObject(jw, "end_ms", cJSON_CreateNumber(duration_to_ms(info.end_offset())));
+                }
+                if (info.confidence() > 0.0f) {
+                    cJSON_AddItemToObject(jw, "confidence", cJSON_CreateNumber(info.confidence()));
+                }
+                cJSON_AddItemToArray(words, jw);
+            }
+            cJSON_AddItemToObject(jrr, "speech_word_info", words);
+        }
         cJSON_AddItemToObject(json, "recognition_result", jrr);
     }
 

@@ -53,6 +53,15 @@ dialogflow_stop <uuid>
 ```
 Stops dialogflow on the channel.
 
+#### dialogflow_capture
+```
+dialogflow_capture <uuid> <start_ms> <duration_ms> [tag]
+```
+Extracts audio from the rolling caller-side buffer and emits
+`dialogflow::audio_snippet` with metadata describing the snippet. Use this to
+forward a problematic utterance to an alternate recogniser (e.g. Whisper). `tag`
+is optional and echoed in the snippet event to help correlate the response.
+
 #### dialogflow_version
 ```
 dialogflow_version
@@ -64,6 +73,7 @@ Prints the module version, git hash, build date and build type, e.g.:
 * `dialogflow::intent` - a dialogflow [intent](https://dialogflow.com/docs/intents) has been detected.
 * `dialogflow::transcription` - a transcription has been returned (suppressed if `DIALOGFLOW_TRANSCRIPT_FINAL_ONLY=true` and interim).
 * `dialogflow::audio_provided` - an audio prompt has been returned from Dialogflow. The module writes the audio to a temporary file and fires this event with JSON `{ "path": "/tmp/....wav|.mp3|.opus" }`. Playback is not automatic unless `DIALOGFLOW_AUTOPLAY` is enabled.
+* `dialogflow::audio_snippet` - emitted when `dialogflow_capture` succeeds. The JSON body includes the on-disk snippet path, timing metadata, and the optional `tag` supplied in the command.
 * `dialogflow::end_of_utterance` - dialogflow has detected the end of an utterance
 * `dialogflow::error` - dialogflow has returned an error
 * `dialogflow::webhook_error` - one or more Dialogflow webhooks failed for the turn. Emitted once per failing webhook with JSON body including `index`, `code`, `message`, `category`, `retryable`, optional `diagnostic_info`, and when enabled `query_params`. The event does not stop the session by itself; decide in your app whether to retry/fallback.
@@ -82,11 +92,18 @@ Prints the module version, git hash, build date and build type, e.g.:
   - When `DIALOGFLOW_INCLUDE_QUERY_PARAMS=true`, `query_params` contains `{ channel, payload }`.
 
 - `dialogflow::transcription`
-  - Body: `{ recognition_result:{ transcript, is_final, message_type }, [query_params] }`
+  - Body: `{ recognition_result:{ transcript, is_final, message_type, [confidence], [speech_word_info:[]], [turn_id], [turn_start_ms], [absolute_start_ms], [absolute_end_ms], [spool_available:true|false] }, [query_params] }`
+  - `speech_word_info` (when enabled by Dialogflow) contains `{ word, start_ms, end_ms, [confidence] }` entries for each recognised token.
+  - `absolute_*` timings and `turn_*` ids are derived from the streaming pipeline and make it easier to request a matching snippet via `dialogflow_capture`.
+  - `spool_available` indicates whether disk spooling is active on the FreeSWITCH leg; you cannot call `dialogflow_capture` when it is `false`.
   - On final transcripts, `turn_timing` may be included when `DIALOGFLOW_INCLUDE_DIAGNOSTIC_INFO=true`.
 
 - `dialogflow::end_of_utterance`
   - Body: `{ recognition_result:{ message_type:"END_OF_SINGLE_UTTERANCE", is_final:false, transcript:"" } }`
+
+- `dialogflow::audio_snippet`
+  - Body: `{ path, tag, start_ms, end_ms, duration_ms }`
+  - Emitted after `dialogflow_capture`. `path` points to a 16-bit mono PCM WAV file that can be passed to an alternate recogniser. Timing fields are relative to the beginning of the Dialogflow session.
 
 - `dialogflow::audio_provided`
   - Default body: `{ path:"/tmp/....wav|.mp3|.opus" }`
@@ -125,6 +142,10 @@ if (typeof data?.body === 'string' && data.body.trim().startsWith('{')) {
 - `DIALOGFLOW_AUTOPLAY`: If `true`, auto-play returned TTS on the A-leg.
 - `DIALOGFLOW_AUTOPLAY_SYNC`: When `true` and `DIALOGFLOW_AUTOPLAY` is enabled, play the agent audio synchronously and block the next user turn until playback completes. Defaults to `true` when `DIALOGFLOW_AUTOPLAY` is set. Set to `false` to retain legacy async `uuid_broadcast` behavior.
 - `DIALOGFLOW_BARGE_IN`: When `true`, do not block listening during agent playback (barge-in enabled). Defaults to `false`.
+- `DIALOGFLOW_SPOOL_SEC`: Number of seconds of caller audio to keep on disk for snippet extraction. When set to `0` or unset, spooling is disabled. Recommended default: `20`.
+- `DIALOGFLOW_SPOOL_DIR`: Optional directory for storing spool chunks (default `/tmp/dialogflow-spool`). Ensure the FreeSWITCH user can read/write the path.
+- `DIALOGFLOW_SPOOL_CHUNK_MS`: Optional chunk size in milliseconds for on-disk rotation (default `2000`).
+- `DIALOGFLOW_SPOOL_PRESERVE`: When `true`, leave the spool directory intact after the call ends (useful for debugging). Defaults to `false`.
 
 - `DIALOGFLOW_INCLUDE_QUERY_PARAMS`: When `true`, all Dialogflow events emitted by the module include a `query_params` object with:
   - `channel`: the request-side `QueryParameters.channel` if set (via `DIALOGFLOW_CHANNEL` or JSON `channel`).
@@ -164,6 +185,44 @@ Notes:
 
 All module events also include the following headers for quick filtering without parsing JSON:
 - `DF-Session-Path`, `DF-Session-Id`, `DF-Project`, `DF-Agent`, `DF-Region`, `DF-Environment`, `DF-Channel` (when set), `DF-Response-Id`, `DF-Intent`, `DF-Page`, and for audio `DF-Audio-Path` (when body suppressed).
+
+### Alternate transcription providers (ivr.js)
+The sample `ivr.js` can forward low-confidence, digit-heavy turns to an external ASR
+service. Pick a provider via `ASR_PROVIDER` (`REST`, `OPENAI`, `DEEPGRAM`, or `GOOGLE`).
+
+Common controls:
+
+- `WHISPER_CONFIDENCE_THRESHOLD`: Trigger fallback when Dialogflow confidence is below this value (default `0.85`).
+- `WHISPER_MIN_DIGITS`: Minimum digit count that qualifies for fallback (default `4`).
+- `WHISPER_ALT_MAX_PER_CALL`: Maximum alternate-ASR requests per call (default `3`).
+- `WHISPER_CAPTURE_LEAD_MS` / `WHISPER_CAPTURE_TAIL_MS`: Extra audio in milliseconds prepended/appended to the snippet when calling `dialogflow_capture` (defaults `400`/`600`).
+- `ASR_SAMPLE_RATE`: Expected sample rate of the snippets (default `16000`).
+- `WHISPER_LANGUAGE` (or `ASR_LANGUAGE`): Preferred BCP-47 language; locale suffixes are normalised to ISO-639 where required.
+- `WHISPER_INITIAL_PROMPT` (or `ASR_INITIAL_PROMPT`): Optional prompt/hint passed to providers that support it.
+
+Provider-specific options:
+
+**REST (Whisper webservice / custom HTTP)**
+- `REST_ASR_ENDPOINT_URL` (or legacy `WHISPER_ENDPOINT_URL`): base URL for `/asr` endpoint (multipart `audio_file`).
+- `WHISPER_TASK`, `WHISPER_OUTPUT_FORMAT`, `WHISPER_ENCODE`: forwarded as query parameters when present.
+- `WHISPER_API_TIMEOUT_MS`: HTTP timeout (default `8000`).
+
+**OpenAI Whisper / GPT-4o transcription**
+- Set `ASR_PROVIDER=OPENAI` and provide `OPENAI_API_KEY`.
+- `OPENAI_WHISPER_MODEL` selects the transcription model (default `whisper-1`).
+
+**Deepgram**
+- Set `ASR_PROVIDER=DEEPGRAM` and provide `DEEPGRAM_API_KEY`.
+- `DEEPGRAM_MODEL` chooses the transcription model (default `nova-2`).
+
+**Google Cloud Speech-to-Text (Chirp)**
+- Set `ASR_PROVIDER=GOOGLE` and ensure ADC credentials are available (`GOOGLE_APPLICATION_CREDENTIALS` or workload identity).
+- `GOOGLE_SPEECH_REGION` **must** be provided (e.g. `us-central1`) and should match the region where the Chirp model is available.
+- `GOOGLE_SPEECH_MODEL` selects the recogniser (default `chirp`).
+- `GOOGLE_SPEECH_LANGUAGE_CODE` is the language.
+
+Ensure disk spooling is enabled (`DIALOGFLOW_SPOOL_SEC>0`) so that
+`dialogflow_capture` can extract audio snippets for the alternate recogniser.
 
 ### Turn Timing During Playback
 By default, when `DIALOGFLOW_AUTOPLAY` is enabled the module now avoids opening a new Dialogflow turn until the returned agent audio has finished playing. This prevents spurious `no_input` while the caller is listening to long prompts.

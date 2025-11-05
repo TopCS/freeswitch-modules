@@ -17,8 +17,17 @@
 #include <sstream>
 #include <map>
 #include <set>
+#include <vector>
 #include <thread>
 #include <chrono>
+#include <deque>
+#include <filesystem>
+#include <cctype>
+#include <ctime>
+#include <memory>
+#include <inttypes.h>
+
+#include "google/protobuf/duration.pb.h"
 
 #include "google/cloud/dialogflow/cx/v3/session.grpc.pb.h"
 
@@ -44,9 +53,425 @@ using google::protobuf::Struct;
 using google::protobuf::Value;
 using google::protobuf::MapPair;
 
+namespace fs = std::filesystem;
+
 static uint64_t playCount = 0;
 static std::multimap<std::string, std::string> audioFiles;
 static bool hasDefaultCredentials = false;
+
+static std::string sanitize_tag(const std::string& tag) {
+    std::string out;
+    out.reserve(tag.size());
+    for (char c : tag) {
+        unsigned char uc = static_cast<unsigned char>(c);
+        if (std::isalnum(uc) || c == '-' || c == '_') {
+            out.push_back(c);
+        } else if (std::isspace(uc)) {
+            out.push_back('_');
+        }
+    }
+    if (out.empty()) {
+        out.assign("snippet");
+    }
+    return out;
+}
+
+static std::string timestamp_now() {
+    switch_time_t now = switch_micro_time_now();
+    time_t seconds = static_cast<time_t>(now / 1000000);
+    struct tm tm_now;
+#ifdef _WIN32
+    gmtime_s(&tm_now, &seconds);
+#else
+    gmtime_r(&seconds, &tm_now);
+#endif
+    char buf[64];
+    unsigned int micros = static_cast<unsigned int>(now % 1000000);
+    switch_snprintf(buf, sizeof(buf), "%04d%02d%02dT%02d%02d%02d_%06u",
+                    tm_now.tm_year + 1900, tm_now.tm_mon + 1, tm_now.tm_mday,
+                    tm_now.tm_hour, tm_now.tm_min, tm_now.tm_sec, micros);
+    return std::string(buf);
+}
+
+static uint64_t duration_to_samples(const google::protobuf::Duration& d, uint32_t sampleRate) {
+    int64_t seconds = d.seconds();
+    int32_t nanos = d.nanos();
+    int64_t totalNanos = seconds * 1000000000LL + nanos;
+    if (totalNanos <= 0) {
+        return 0;
+    }
+    // Avoid overflow by operating in double then casting.
+    double samples = (static_cast<double>(totalNanos) / 1000000000.0) * static_cast<double>(sampleRate);
+    if (samples <= 0.0) {
+        return 0;
+    }
+    return static_cast<uint64_t>(samples + 0.5);
+}
+
+static double samples_to_ms(uint64_t samples, uint32_t sampleRate) {
+    if (!sampleRate) {
+        return 0.0;
+    }
+    double seconds = static_cast<double>(samples) / static_cast<double>(sampleRate);
+    return seconds * 1000.0;
+}
+
+struct AudioSpooler {
+    struct ChunkInfo {
+        uint64_t startSample = 0;
+        uint64_t sampleCount = 0;
+        std::string path;
+        bool finalised = false;
+    };
+
+    switch_bool_t enabled = SWITCH_FALSE;
+    std::string rootDir;
+    std::string sessionDir;
+    std::string chunkDir;
+    std::string snippetDir;
+    std::string sessionId;
+    uint32_t sampleRate = 0;
+    uint32_t chunkMs = 0;
+    uint32_t horizonMs = 0;
+    uint64_t samplesPerChunk = 0;
+    uint64_t maxSamples = 0;
+    uint64_t totalSamples = 0;
+    uint64_t chunkCounter = 0;
+    uint64_t currentChunkSamples = 0;
+    uint64_t currentChunkStartSample = 0;
+    bool preserve = false;
+    std::unique_ptr<std::ofstream> currentStream;
+    std::deque<ChunkInfo> chunks;
+
+    switch_status_t configure(switch_core_session_t* session, const std::string& sid, uint32_t rate) {
+        switch_channel_t* channel = switch_core_session_get_channel(session);
+        const char* secVar = switch_channel_get_variable(channel, "DIALOGFLOW_SPOOL_SEC");
+        int horizonSec = secVar ? atoi(secVar) : 0;
+        if (horizonSec <= 0) {
+            enabled = SWITCH_FALSE;
+            return SWITCH_STATUS_SUCCESS;
+        }
+
+        sessionId = sid;
+        sampleRate = rate;
+        horizonMs = static_cast<uint32_t>(horizonSec * 1000);
+        if (horizonMs == 0) horizonMs = 1000;
+
+        const char* chunkVar = switch_channel_get_variable(channel, "DIALOGFLOW_SPOOL_CHUNK_MS");
+        int chunkMsCandidate = chunkVar ? atoi(chunkVar) : 2000;
+        if (chunkMsCandidate < 200) chunkMsCandidate = 200;
+        if (chunkMsCandidate > horizonMs) chunkMsCandidate = horizonMs;
+        chunkMs = static_cast<uint32_t>(chunkMsCandidate);
+
+        const char* dirVar = switch_channel_get_variable(channel, "DIALOGFLOW_SPOOL_DIR");
+        rootDir = (dirVar && *dirVar) ? dirVar : "/tmp/dialogflow-spool";
+
+        preserve = switch_true(switch_channel_get_variable(channel, "DIALOGFLOW_SPOOL_PRESERVE"));
+
+        samplesPerChunk = std::max<uint64_t>(1, (static_cast<uint64_t>(sampleRate) * chunkMs) / 1000);
+        maxSamples = std::max<uint64_t>(samplesPerChunk, (static_cast<uint64_t>(sampleRate) * horizonMs) / 1000);
+
+        sessionDir = rootDir + "/" + sid;
+        chunkDir = sessionDir + "/chunks";
+        snippetDir = sessionDir + "/snippets";
+
+        std::error_code ec;
+        fs::remove_all(sessionDir, ec);
+        ec.clear();
+        fs::create_directories(chunkDir, ec);
+        if (ec) {
+            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
+                "AudioSpooler: failed to create chunk directory '%s': %s\n",
+                chunkDir.c_str(), ec.message().c_str());
+            enabled = SWITCH_FALSE;
+            return SWITCH_STATUS_FALSE;
+        }
+        ec.clear();
+        fs::create_directories(snippetDir, ec);
+        if (ec) {
+            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
+                "AudioSpooler: failed to create snippet directory '%s': %s\n",
+                snippetDir.c_str(), ec.message().c_str());
+            enabled = SWITCH_FALSE;
+            return SWITCH_STATUS_FALSE;
+        }
+
+        switch_channel_set_variable(channel, "DF_SPOOL_DIR", sessionDir.c_str());
+        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO,
+            "Audio spool enabled (horizon=%ums chunk=%ums dir=%s preserve=%s)\n",
+            horizonMs, chunkMs, sessionDir.c_str(), preserve ? "true" : "false");
+
+        enabled = SWITCH_TRUE;
+        totalSamples = 0;
+        chunkCounter = 0;
+        currentChunkSamples = 0;
+        currentChunkStartSample = 0;
+        chunks.clear();
+        currentStream.reset();
+        return SWITCH_STATUS_SUCCESS;
+    }
+
+    void cleanup() {
+        if (currentStream && currentStream->is_open()) {
+            currentStream->close();
+        }
+        currentStream.reset();
+        if (!preserve && !sessionDir.empty()) {
+            std::error_code ec;
+            fs::remove_all(sessionDir, ec);
+        }
+        chunks.clear();
+        enabled = SWITCH_FALSE;
+    }
+
+    uint64_t earliestSample() const {
+        if (chunks.empty()) return totalSamples;
+        return chunks.front().startSample;
+    }
+
+    uint64_t latestSample() const {
+        return totalSamples;
+    }
+
+    void flushActive() {
+        if (currentStream) {
+            currentStream->flush();
+        }
+    }
+
+    switch_status_t openNewChunk(switch_core_session_t* session) {
+        if (currentStream && currentStream->is_open()) {
+            currentStream->close();
+        }
+
+        currentChunkStartSample = totalSamples;
+        currentChunkSamples = 0;
+
+        char filename[64];
+        switch_snprintf(filename, sizeof(filename), "chunk-%05" PRIu64 ".raw", chunkCounter++);
+        std::string path = chunkDir + "/" + filename;
+
+        currentStream = std::make_unique<std::ofstream>(path, std::ios::binary | std::ios::trunc);
+        if (!currentStream->is_open()) {
+            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
+                "AudioSpooler: unable to open chunk file '%s'\n", path.c_str());
+            currentStream.reset();
+            return SWITCH_STATUS_FALSE;
+        }
+
+        ChunkInfo info;
+        info.startSample = currentChunkStartSample;
+        info.sampleCount = 0;
+        info.path = path;
+        info.finalised = false;
+        chunks.push_back(info);
+        return SWITCH_STATUS_SUCCESS;
+    }
+
+    void finalizeChunk() {
+        if (currentStream && currentStream->is_open()) {
+            currentStream->flush();
+            currentStream->close();
+        }
+        if (!chunks.empty()) {
+            chunks.back().finalised = true;
+        }
+        currentStream.reset();
+        currentChunkSamples = 0;
+    }
+
+    void pruneOldChunks() {
+        if (maxSamples == 0) return;
+        uint64_t allowed = (totalSamples > maxSamples) ? (totalSamples - maxSamples) : 0;
+        while (!chunks.empty()) {
+            const ChunkInfo& front = chunks.front();
+            uint64_t chunkEnd = front.startSample + front.sampleCount;
+            if (chunkEnd > allowed) {
+                break;
+            }
+            std::error_code ec;
+            fs::remove(front.path, ec);
+            chunks.pop_front();
+        }
+    }
+
+    void ingest(switch_core_session_t* session, const int16_t* samples, size_t sampleCount) {
+        if (enabled != SWITCH_TRUE || !sampleCount || !sampleRate) {
+            totalSamples += sampleCount;
+            return;
+        }
+
+        size_t offset = 0;
+        while (offset < sampleCount) {
+            if (!currentStream) {
+                if (openNewChunk(session) != SWITCH_STATUS_SUCCESS) {
+                    return;
+                }
+            }
+
+            size_t remainingInChunk = samplesPerChunk > currentChunkSamples
+                ? static_cast<size_t>(samplesPerChunk - currentChunkSamples)
+                : 0;
+            if (!remainingInChunk) {
+                finalizeChunk();
+                continue;
+            }
+
+            size_t toWrite = std::min(remainingInChunk, sampleCount - offset);
+            currentStream->write(reinterpret_cast<const char*>(samples + offset),
+                                 static_cast<std::streamsize>(toWrite * sizeof(int16_t)));
+            if (!(*currentStream)) {
+                switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
+                    "AudioSpooler: failed writing chunk file '%s'\n", chunks.back().path.c_str());
+                currentStream->clear();
+                return;
+            }
+
+            currentChunkSamples += toWrite;
+            chunks.back().sampleCount += toWrite;
+            offset += toWrite;
+            totalSamples += toWrite;
+
+            if (currentChunkSamples >= samplesPerChunk) {
+                finalizeChunk();
+            }
+        }
+
+        pruneOldChunks();
+    }
+
+    switch_status_t readSamplesFromChunk(const ChunkInfo& chunk, uint64_t offsetSamples,
+                                         uint64_t samplesToCopy, std::vector<int16_t>& out) {
+        if (!samplesToCopy) return SWITCH_STATUS_SUCCESS;
+        std::ifstream input(chunk.path, std::ios::binary);
+        if (!input.is_open()) {
+            return SWITCH_STATUS_FALSE;
+        }
+        input.seekg(static_cast<std::streamoff>(offsetSamples * sizeof(int16_t)), std::ios::beg);
+        if (!input.good()) {
+            return SWITCH_STATUS_FALSE;
+        }
+        std::vector<int16_t> tmp(samplesToCopy);
+        input.read(reinterpret_cast<char*>(tmp.data()), static_cast<std::streamsize>(samplesToCopy * sizeof(int16_t)));
+        std::streamsize got = input.gcount();
+        if (got <= 0) {
+            return SWITCH_STATUS_FALSE;
+        }
+        size_t samplesRead = static_cast<size_t>(got / sizeof(int16_t));
+        tmp.resize(samplesRead);
+        out.insert(out.end(), tmp.begin(), tmp.end());
+        return SWITCH_STATUS_SUCCESS;
+    }
+
+    switch_status_t writeWav(const std::string& path, const std::vector<int16_t>& data) {
+        std::ofstream output(path, std::ios::binary | std::ios::trunc);
+        if (!output.is_open()) {
+            return SWITCH_STATUS_FALSE;
+        }
+
+        uint16_t audioFormat = 1; // PCM
+        uint16_t numChannels = 1;
+        uint16_t bitsPerSample = 16;
+        uint32_t byteRate = sampleRate * numChannels * (bitsPerSample / 8);
+        uint16_t blockAlign = numChannels * (bitsPerSample / 8);
+        uint32_t dataSize = static_cast<uint32_t>(data.size() * sizeof(int16_t));
+        uint32_t chunkSize = 36 + dataSize;
+
+        output.write("RIFF", 4);
+        output.write(reinterpret_cast<const char*>(&chunkSize), sizeof(chunkSize));
+        output.write("WAVE", 4);
+        output.write("fmt ", 4);
+        uint32_t subchunk1Size = 16;
+        output.write(reinterpret_cast<const char*>(&subchunk1Size), sizeof(subchunk1Size));
+        output.write(reinterpret_cast<const char*>(&audioFormat), sizeof(audioFormat));
+        output.write(reinterpret_cast<const char*>(&numChannels), sizeof(numChannels));
+        output.write(reinterpret_cast<const char*>(&sampleRate), sizeof(sampleRate));
+        output.write(reinterpret_cast<const char*>(&byteRate), sizeof(byteRate));
+        output.write(reinterpret_cast<const char*>(&blockAlign), sizeof(blockAlign));
+        output.write(reinterpret_cast<const char*>(&bitsPerSample), sizeof(bitsPerSample));
+        output.write("data", 4);
+        output.write(reinterpret_cast<const char*>(&dataSize), sizeof(dataSize));
+        if (dataSize) {
+            output.write(reinterpret_cast<const char*>(data.data()), dataSize);
+        }
+        return output.good() ? SWITCH_STATUS_SUCCESS : SWITCH_STATUS_FALSE;
+    }
+
+    switch_status_t capture(switch_core_session_t* session, uint64_t startMs, uint64_t durationMs,
+                            const std::string& tag, std::string& outPath,
+                            uint64_t& actualStartMs, uint64_t& actualEndMs) {
+        if (enabled != SWITCH_TRUE || chunks.empty() || !sampleRate) {
+            return SWITCH_STATUS_FALSE;
+        }
+
+        flushActive();
+
+        if (!durationMs) durationMs = chunkMs;
+
+        uint64_t requestedStartSamples = (startMs * sampleRate) / 1000;
+        uint64_t requestedSamples = std::max<uint64_t>(1, (durationMs * sampleRate) / 1000);
+        uint64_t requestedEndSamples = requestedStartSamples + requestedSamples;
+
+        uint64_t earliest = earliestSample();
+        uint64_t latest = latestSample();
+        if (requestedStartSamples < earliest) {
+            requestedStartSamples = earliest;
+        }
+        if (requestedEndSamples > latest) {
+            requestedEndSamples = latest;
+        }
+        if (requestedStartSamples >= requestedEndSamples) {
+            return SWITCH_STATUS_FALSE;
+        }
+
+        std::vector<int16_t> collected;
+        collected.reserve(static_cast<size_t>(requestedEndSamples - requestedStartSamples));
+
+        for (const auto& chunk : chunks) {
+            uint64_t chunkStart = chunk.startSample;
+            uint64_t chunkEnd = chunk.startSample + chunk.sampleCount;
+            if (chunkEnd <= requestedStartSamples) {
+                continue;
+            }
+            if (chunkStart >= requestedEndSamples) {
+                break;
+            }
+            uint64_t from = std::max(chunkStart, requestedStartSamples);
+            uint64_t to = std::min(chunkEnd, requestedEndSamples);
+            uint64_t localOffset = from - chunkStart;
+            uint64_t toCopy = to - from;
+            if (readSamplesFromChunk(chunk, localOffset, toCopy, collected) != SWITCH_STATUS_SUCCESS) {
+                switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
+                    "AudioSpooler: failed reading chunk '%s'\n", chunk.path.c_str());
+                return SWITCH_STATUS_FALSE;
+            }
+        }
+
+        if (collected.empty()) {
+            return SWITCH_STATUS_FALSE;
+        }
+
+        std::string safeTag = sanitize_tag(tag);
+        std::string ts = timestamp_now();
+        std::string filename = safeTag + "-" + ts + ".wav";
+        outPath = snippetDir + "/" + filename;
+
+        if (writeWav(outPath, collected) != SWITCH_STATUS_SUCCESS) {
+            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
+                "AudioSpooler: failed writing snippet '%s'\n", outPath.c_str());
+            return SWITCH_STATUS_FALSE;
+        }
+
+        actualStartMs = static_cast<uint64_t>(samples_to_ms(requestedStartSamples, sampleRate));
+        actualEndMs = static_cast<uint64_t>(samples_to_ms(requestedStartSamples + collected.size(), sampleRate));
+
+        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO,
+            "AudioSpooler: captured snippet %s (start=%" PRIu64 "ms end=%" PRIu64 "ms duration=%" PRIu64 "ms)\n",
+            outPath.c_str(), actualStartMs, actualEndMs, actualEndMs > actualStartMs ? actualEndMs - actualStartMs : 0);
+
+        return SWITCH_STATUS_SUCCESS;
+    }
+};
 
 // Forward declaration for internal stop helper defined later in this file
 extern "C" switch_status_t google_dialogflow_session_stop(switch_core_session_t *session, int channelIsClosing);
@@ -254,7 +679,8 @@ public:
             m_speakingRate(), m_pitch(), m_volume(), m_voiceName(""), m_voiceGender(""), m_effects(""),
             m_sentimentAnalysis(false), m_finished(false), m_packets(0), m_needConfig(false),
             m_paused(false),
-            m_startedWithEvent(false), m_rotatedToAudio(false), m_sampleRate(sampleRate), m_outputEncoding(OutputAudioEncoding::OUTPUT_AUDIO_ENCODING_LINEAR_16) {
+            m_startedWithEvent(false), m_rotatedToAudio(false), m_sampleRate(sampleRate), m_outputEncoding(OutputAudioEncoding::OUTPUT_AUDIO_ENCODING_LINEAR_16),
+            m_totalSamples(0), m_turnStartSample(0), m_turnIndex(0) {
 		const char* var;
 		switch_channel_t* channel = switch_core_session_get_channel(session);
 
@@ -315,6 +741,9 @@ public:
             else m_outputEncoding = OutputAudioEncoding::OUTPUT_AUDIO_ENCODING_LINEAR_16;
         }
 
+        (void) m_spool.configure(session, m_sessionId, m_sampleRate);
+        m_totalSamples = m_spool.totalSamples;
+
 			if ((var = switch_channel_get_variable(channel, "GOOGLE_APPLICATION_CREDENTIALS"))) {
 				std::string input = var;
 				std::string json = input;
@@ -350,9 +779,11 @@ public:
 			}
     }
 
-	~GStreamer() {
-		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "GStreamer::~GStreamer wrote %u packets %p\n", m_packets, this);		
-	}
+    ~GStreamer() {
+        try { m_spool.cleanup(); } catch (...) {}
+        switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG,
+            "GStreamer::~GStreamer wrote %u packets %p\n", m_packets, this);
+    }
 
     void startStream(switch_core_session_t *session, const char* event, const char* text) {
         char szSession[256];
@@ -593,7 +1024,7 @@ public:
 		m_streamer->Write(*m_request);
 		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "GStreamer::startStream initial request sent; waiting for responses\n");
 	}
-    bool write(void* data, uint32_t datalen) {
+	bool write(switch_core_session_t* session, void* data, uint32_t datalen) {
 		if (m_finished) {
 			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "GStreamer::write not writing because we are finished, %p\n", this);
 			return false;
@@ -622,6 +1053,12 @@ public:
             ai->clear_config();
         }
         ai->set_audio(reinterpret_cast<const char*>(data), datalen);
+
+        size_t sampleCount = datalen / sizeof(int16_t);
+        if (sampleCount) {
+            m_spool.ingest(session, reinterpret_cast<const int16_t*>(data), sampleCount);
+            m_totalSamples = m_spool.totalSamples;
+        }
 
 		m_packets++;
     return m_streamer->Write(*m_request);
@@ -671,11 +1108,25 @@ public:
     const std::string& requestParamsJSON() const { return m_requestParamsJSON; }
     const std::string& sessionId() const { return m_sessionId; }
     uint32_t sampleRate() const { return m_sampleRate; }
+    uint64_t currentTurnIndex() const { return m_turnIndex; }
+    uint64_t turnStartSampleCount() const { return m_turnStartSample; }
+    uint64_t totalSamplesSent() const { return m_totalSamples; }
+    bool isSpooling() const { return m_spool.enabled == SWITCH_TRUE; }
+    switch_status_t captureSnippet(switch_core_session_t* session, uint64_t startMs, uint64_t durationMs,
+            const std::string& tag, std::string& outPath, uint64_t& actualStartMs, uint64_t& actualEndMs) {
+        return m_spool.capture(session, startMs, durationMs, tag, outPath, actualStartMs, actualEndMs);
+    }
+    void stopSpool() {
+        m_spool.cleanup();
+    }
 
     // Turn timing markers
     void markTurnStart() {
         m_turnStartMs = switch_micro_time_now() / 1000;
         m_finalRecogMs = 0; m_eouMs = 0; m_detectMs = 0;
+        m_turnStartSample = m_spool.totalSamples;
+        ++m_turnIndex;
+        m_totalSamples = m_spool.totalSamples;
     }
     void markFinalRecog() { if (!m_finalRecogMs) m_finalRecogMs = switch_micro_time_now() / 1000; }
     void markEOU() { if (!m_eouMs) m_eouMs = switch_micro_time_now() / 1000; }
@@ -785,8 +1236,12 @@ private:
     bool m_rotatedToAudio;
     std::string m_qpChannel;
     uint32_t m_sampleRate;
-    OutputAudioEncoding m_outputEncoding;
+   OutputAudioEncoding m_outputEncoding;
     std::string m_requestParamsJSON;
+    AudioSpooler m_spool;
+    uint64_t m_totalSamples;
+    uint64_t m_turnStartSample;
+    uint64_t m_turnIndex;
     // Turn timing
     uint64_t m_turnStartMs = 0;
     uint64_t m_finalRecogMs = 0;
@@ -877,12 +1332,37 @@ static void *SWITCH_THREAD_FUNC grpc_read_thread(switch_thread_t *thread, void *
                                     }
                                     cb->lastTranscriptMs = now_ms;
                                 }
-                            }
-                        }
                     }
-                    cJSON* jResponse = parser.parse(response);
-                    // Optionally enrich with diagnostic_info and turn timing
-                    if (response.has_detect_intent_response()) {
+                }
+            }
+            cJSON* jResponse = parser.parse(response);
+            if (response.has_recognition_result()) {
+                const auto& rrMeta = response.recognition_result();
+                cJSON* jrr = cJSON_GetObjectItemCaseSensitive(jResponse, "recognition_result");
+                if (jrr) {
+                    double turnStartMs = samples_to_ms(streamer->turnStartSampleCount(), streamer->sampleRate());
+                    cJSON_AddItemToObject(jrr, "turn_id", cJSON_CreateNumber((double)streamer->currentTurnIndex()));
+                    cJSON_AddItemToObject(jrr, "turn_start_ms", cJSON_CreateNumber(turnStartMs));
+
+                    uint64_t absStartSamples = streamer->turnStartSampleCount();
+                    uint64_t absEndSamples = absStartSamples;
+                    if (rrMeta.speech_word_info_size() > 0) {
+                        absStartSamples += duration_to_samples(rrMeta.speech_word_info(0).start_offset(), streamer->sampleRate());
+                        const auto& lastWord = rrMeta.speech_word_info(rrMeta.speech_word_info_size() - 1);
+                        absEndSamples += duration_to_samples(lastWord.end_offset(), streamer->sampleRate());
+                    } else if (rrMeta.is_final()) {
+                        absEndSamples = streamer->totalSamplesSent();
+                    }
+                    if (rrMeta.is_final() && absEndSamples < streamer->totalSamplesSent()) {
+                        absEndSamples = streamer->totalSamplesSent();
+                    }
+                    cJSON_AddItemToObject(jrr, "absolute_start_ms", cJSON_CreateNumber(samples_to_ms(absStartSamples, streamer->sampleRate())));
+                    cJSON_AddItemToObject(jrr, "absolute_end_ms", cJSON_CreateNumber(samples_to_ms(absEndSamples, streamer->sampleRate())));
+                    cJSON_AddItemToObject(jrr, "spool_available", cJSON_CreateBool(streamer->isSpooling()));
+                }
+            }
+            // Optionally enrich with diagnostic_info and turn timing
+            if (response.has_detect_intent_response()) {
                         const auto& dir2 = response.detect_intent_response();
                         if (dir2.has_query_result()) {
                             const auto& qr2 = dir2.query_result();
@@ -1686,7 +2166,7 @@ extern "C" {
 						
 						speex_resampler_process_interleaved_int(cb->resampler, (const spx_int16_t *) frame.data, (spx_uint32_t *) &in_len, &out[0], &out_len);
 						
-						streamer->write( &out[0], sizeof(spx_int16_t) * out_len);
+						streamer->write(session, &out[0], sizeof(spx_int16_t) * out_len);
 					}
 				}
 			}
@@ -1699,9 +2179,50 @@ extern "C" {
 		else {
 			//switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, 
 			//	"google_dialogflow_frame: not sending audio since failed to get lock on mutex\n");
-		}
-		return SWITCH_TRUE;
 	}
+	return SWITCH_TRUE;
+}
+
+switch_status_t google_dialogflow_capture_snippet(struct cap_cb* cb, switch_core_session_t* session,
+        uint64_t start_ms, uint64_t duration_ms, const char* tag,
+        char* out_path, size_t out_path_len, uint64_t* actual_start_ms, uint64_t* actual_end_ms) {
+    if (!cb || !cb->streamer || !session) {
+        return SWITCH_STATUS_FALSE;
+    }
+    switch_status_t status = SWITCH_STATUS_FALSE;
+    std::string path;
+    uint64_t realStart = 0;
+    uint64_t realEnd = 0;
+
+    switch_mutex_lock(cb->mutex);
+    GStreamer* streamer = (GStreamer*) cb->streamer;
+    if (streamer->isSpooling()) {
+        status = streamer->captureSnippet(session, start_ms, duration_ms,
+            tag ? tag : "snippet", path, realStart, realEnd);
+    }
+    switch_mutex_unlock(cb->mutex);
+
+    if (status == SWITCH_STATUS_SUCCESS) {
+        if (out_path && out_path_len) {
+            switch_snprintf(out_path, out_path_len, "%s", path.c_str());
+        }
+        if (actual_start_ms) *actual_start_ms = realStart;
+        if (actual_end_ms) *actual_end_ms = realEnd;
+    }
+    return status;
+}
+
+void google_dialogflow_spool_cleanup(struct cap_cb* cb, switch_core_session_t* session, switch_bool_t preserve) {
+    (void)session;
+    (void)preserve;
+    if (!cb || !cb->streamer) {
+        return;
+    }
+    switch_mutex_lock(cb->mutex);
+    GStreamer* streamer = (GStreamer*) cb->streamer;
+    streamer->stopSpool();
+    switch_mutex_unlock(cb->mutex);
+}
 
 	void destroyChannelUserData(struct cap_cb* cb) {
 		killcb(cb);
