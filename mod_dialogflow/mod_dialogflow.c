@@ -5,6 +5,7 @@
  */
 #include "mod_dialogflow.h"
 #include "google_glue.h"
+#include "common/fs_event_utils.h"
 #include "build_info.h"
 #include <switch_json.h>
 
@@ -47,45 +48,31 @@ SWITCH_STANDARD_API(dialogflow_api_version_function)
 
 SWITCH_STANDARD_API(dialogflow_api_capture_function);
 
+static const fs_channel_var_header_map_t k_dialogflow_event_headers[] = {
+    { "DF_SESSION_PATH", "DF-Session-Path" },
+    { "DF_SESSION_ID", "DF-Session-Id" },
+    { "DF_PROJECT", "DF-Project" },
+    { "DF_AGENT", "DF-Agent" },
+    { "DF_REGION", "DF-Region" },
+    { "DF_ENVIRONMENT", "DF-Environment" },
+    { "DF_CHANNEL", "DF-Channel" },
+    { "DF_RESPONSE_ID", "DF-Response-Id" },
+    { "DF_INTENT", "DF-Intent" },
+    { "DF_PAGE", "DF-Page" },
+    { "DF_AUDIO_PATH", "DF-Audio-Path" },
+};
+
 static void responseHandler(switch_core_session_t* session, const char * type, char * json) {
-    switch_event_t *event;
-    switch_channel_t *channel = switch_core_session_get_channel(session);
-
     switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO, "json payload for type %s: %s.\n", type, json);
-
-    switch_event_create_subclass(&event, SWITCH_EVENT_CUSTOM, type);
-    switch_channel_event_set_data(channel, event);
-    // Add lightweight DF headers for easier filtering
-    const char* h;
-    if ((h = switch_channel_get_variable(channel, "DF_SESSION_PATH"))) switch_event_add_header_string(event, SWITCH_STACK_BOTTOM, "DF-Session-Path", h);
-    if ((h = switch_channel_get_variable(channel, "DF_SESSION_ID"))) switch_event_add_header_string(event, SWITCH_STACK_BOTTOM, "DF-Session-Id", h);
-    if ((h = switch_channel_get_variable(channel, "DF_PROJECT"))) switch_event_add_header_string(event, SWITCH_STACK_BOTTOM, "DF-Project", h);
-    if ((h = switch_channel_get_variable(channel, "DF_AGENT"))) switch_event_add_header_string(event, SWITCH_STACK_BOTTOM, "DF-Agent", h);
-    if ((h = switch_channel_get_variable(channel, "DF_REGION"))) switch_event_add_header_string(event, SWITCH_STACK_BOTTOM, "DF-Region", h);
-    if ((h = switch_channel_get_variable(channel, "DF_ENVIRONMENT"))) switch_event_add_header_string(event, SWITCH_STACK_BOTTOM, "DF-Environment", h);
-    if ((h = switch_channel_get_variable(channel, "DF_CHANNEL"))) switch_event_add_header_string(event, SWITCH_STACK_BOTTOM, "DF-Channel", h);
-    if ((h = switch_channel_get_variable(channel, "DF_RESPONSE_ID"))) switch_event_add_header_string(event, SWITCH_STACK_BOTTOM, "DF-Response-Id", h);
-    if ((h = switch_channel_get_variable(channel, "DF_INTENT"))) switch_event_add_header_string(event, SWITCH_STACK_BOTTOM, "DF-Intent", h);
-    if ((h = switch_channel_get_variable(channel, "DF_PAGE"))) switch_event_add_header_string(event, SWITCH_STACK_BOTTOM, "DF-Page", h);
-    if ((h = switch_channel_get_variable(channel, "DF_AUDIO_PATH"))) switch_event_add_header_string(event, SWITCH_STACK_BOTTOM, "DF-Audio-Path", h);
-    // Back-compat: also include payload as header 'Response' for clients that expect body.response
-    switch_event_add_header_string(event, SWITCH_STACK_BOTTOM, "Response", json);
-    switch_event_add_body(event, "%s", json);
-    switch_event_fire(&event);
+    fs_fire_custom_event_with_body(session, type, json, k_dialogflow_event_headers,
+        sizeof(k_dialogflow_event_headers) / sizeof(k_dialogflow_event_headers[0]));
 }
 static void errorHandler(switch_core_session_t* session, const char * json) {
-    switch_event_t *event;
     switch_channel_t *channel = switch_core_session_get_channel(session);
 
     switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Dialogflow error: %s\n", json);
 
-    switch_event_create_subclass(&event, SWITCH_EVENT_CUSTOM, DIALOGFLOW_EVENT_ERROR);
-    switch_channel_event_set_data(channel, event);
-    // Back-compat: also include payload as header 'Response'
-    switch_event_add_header_string(event, SWITCH_STACK_BOTTOM, "Response", json);
-    switch_event_add_body(event, "%s", json);
-
-    switch_event_fire(&event);
+    fs_fire_custom_event_with_body(session, DIALOGFLOW_EVENT_ERROR, json, NULL, 0);
 
     // Avoid re-entrant stop: if a stop is already in progress, skip
     const char* stopping = switch_channel_get_variable(channel, "DF_STOPPING");

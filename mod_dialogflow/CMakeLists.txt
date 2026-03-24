@@ -8,8 +8,10 @@ set(CMAKE_SHARED_LIBRARY_PREFIX "")
 
 option(ENABLE_LOCAL "Add /usr/local/freeswitch pkgconfig path" ON)
 set(GENS_DIR "" CACHE PATH "Path to generated Google APIs C++ sources root (contains google/...")
+set(CES_GENS_DIR "" CACHE PATH "Path to generated CES C++ sources root (contains google/...)")
 # Allow overriding the FreeSWITCH modules installation directory
 set(FS_MOD_DIR "" CACHE PATH "Override FreeSWITCH modules dir (e.g., /usr/lib/freeswitch/mod)")
+option(BUILD_MOD_CES "Build the CES scaffold module" OFF)
 
 # Embed build metadata (git hash, date)
 execute_process(
@@ -63,6 +65,10 @@ file(GLOB_RECURSE GENS_SOURCES
 add_library(mod_dialogflow SHARED
   mod_dialogflow.c
   mod_dialogflow.h
+  common/audio_spooler.cpp
+  common/audio_spooler.h
+  common/fs_event_utils.c
+  common/fs_event_utils.h
   google_glue.cpp
   google_glue.h
   parser.cpp
@@ -131,6 +137,83 @@ target_link_options(mod_dialogflow PRIVATE
 )
 
 install(TARGETS mod_dialogflow DESTINATION ${FS_MOD_DIR})
+
+if(BUILD_MOD_CES)
+  if(NOT CES_GENS_DIR)
+    message(FATAL_ERROR "CES_GENS_DIR is required when BUILD_MOD_CES=ON")
+  endif()
+
+  file(GLOB_RECURSE CES_GENS_SOURCES
+    "${CES_GENS_DIR}/google/cloud/ces/v1beta/*.pb.cc"
+    "${CES_GENS_DIR}/google/cloud/ces/v1beta/*.grpc.pb.cc"
+    "${CES_GENS_DIR}/google/api/*.pb.cc"
+    "${CES_GENS_DIR}/google/longrunning/*.pb.cc"
+    "${CES_GENS_DIR}/google/logging/type/*.pb.cc"
+    "${CES_GENS_DIR}/google/rpc/*.pb.cc"
+    "${CES_GENS_DIR}/google/type/*.pb.cc"
+  )
+  if(NOT CES_GENS_SOURCES)
+    message(FATAL_ERROR "No generated CES C++ sources found under CES_GENS_DIR='${CES_GENS_DIR}'. Expected *.pb.cc / *.grpc.pb.cc files.")
+  endif()
+
+  add_library(mod_ces SHARED
+    mod_ces.c
+    mod_ces.h
+    common/audio_spooler.cpp
+    common/audio_spooler.h
+    common/fs_event_utils.c
+    common/fs_event_utils.h
+    ces_glue.cpp
+    ces_glue.h
+    ces_parser.cpp
+    ces_parser.h
+    ${CES_GENS_SOURCES}
+  )
+
+  target_compile_definitions(mod_ces PRIVATE NOMINMAX)
+  target_compile_definitions(mod_ces PRIVATE
+    MOD_CES_VERSION="${PROJECT_VERSION}"
+    MOD_CES_GIT_HASH="${GIT_HASH}"
+    MOD_CES_BUILD_TYPE="$<CONFIG>"
+  )
+
+  target_include_directories(mod_ces PRIVATE
+    ${CES_GENS_DIR}
+    ${GRPCPP_INCLUDE_DIRS}
+    ${GRPC_INCLUDE_DIRS}
+    ${Protobuf_INCLUDE_DIRS}
+    ${SPEEXDSP_INCLUDE_DIRS}
+    ${CMAKE_CURRENT_BINARY_DIR}
+  )
+
+  if(_mod_dialogflow_link_dirs)
+    target_link_directories(mod_ces PRIVATE ${_mod_dialogflow_link_dirs})
+  endif()
+
+  add_dependencies(mod_ces gen_build_info)
+
+  foreach(src ${CES_GENS_SOURCES})
+    set_source_files_properties(${src} PROPERTIES COMPILE_FLAGS "-Wno-deprecated-declarations -Wno-unused-parameter")
+  endforeach()
+
+  target_link_libraries(mod_ces PRIVATE
+    PkgConfig::FreeSWITCH
+    ${GRPCPP_LIBRARIES}
+    ${GRPC_LIBRARIES}
+    ${Protobuf_LIBRARIES}
+    ${SPEEXDSP_LIBRARIES}
+    pthread
+  )
+
+  target_link_options(mod_ces PRIVATE
+    ${GRPCPP_LDFLAGS_OTHER}
+    ${GRPC_LDFLAGS_OTHER}
+    ${Protobuf_LDFLAGS_OTHER}
+    ${SPEEXDSP_LDFLAGS_OTHER}
+  )
+
+  install(TARGETS mod_ces DESTINATION ${FS_MOD_DIR})
+endif()
 
 # Packaging (.deb via CPack)
 set(CPACK_GENERATOR "DEB")

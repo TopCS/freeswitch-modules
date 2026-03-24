@@ -2,7 +2,7 @@ BASE=../../../..
 
 # Build and link additional C++ sources needed by the module
 # The FreeSWITCH modmake.rules will include these objects when linking.
-LOCAL_OBJS = google_glue.lo parser.lo
+LOCAL_OBJS = common/fs_event_utils.lo common/audio_spooler.lo google_glue.lo parser.lo
 
 # Link against gRPC C++ and protobuf (and transitively absl, etc.)
 # Put into LDFLAGS_POST so they are not treated as prerequisites.
