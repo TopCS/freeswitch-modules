@@ -141,7 +141,14 @@ if (typeof data?.body === 'string' && data.body.trim().startsWith('{')) {
 - `DIALOGFLOW_PARAMS`: Optional JSON string merged into `QueryParameters.parameters` on start.
 - `DIALOGFLOW_AUTOPLAY`: If `true`, auto-play returned TTS on the A-leg.
 - `DIALOGFLOW_AUTOPLAY_SYNC`: When `true` and `DIALOGFLOW_AUTOPLAY` is enabled, play the agent audio synchronously and block the next user turn until playback completes. Defaults to `true` when `DIALOGFLOW_AUTOPLAY` is set. Set to `false` to retain legacy async `uuid_broadcast` behavior.
-- `DIALOGFLOW_BARGE_IN`: When `true`, do not block listening during agent playback (barge-in enabled). Defaults to `false`.
+- `DIALOGFLOW_BARGE_IN`: When `true`, enable Dialogflow CX barge-in for interruptible prompts during autoplay. For synchronous autoplay, the module starts the next CX stream before playback and sends `InputAudioConfig.barge_in_config` using the actual prompt duration. Defaults to `false`.
+- `DIALOGFLOW_BARGE_IN_NO_BARGE_MS`: Optional initial guard window in milliseconds for the native CX barge-in config. Defaults to `0`.
+- `DIALOGFLOW_BARGE_IN_FORCE`: When `true`, force native barge-in even if the Dialogflow response messages do not mark the prompt as interruptible via `allow_playback_interruption`. Defaults to `false`.
+- `DIALOGFLOW_BARGE_VAD`: When `true` (default), use local FreeSWITCH VAD to stop interruptible playback as soon as the caller starts speaking, without waiting for the first cloud recognition result.
+- `DIALOGFLOW_BARGE_VAD_HOLD_MS`: Minimum stable speech duration required before local VAD cuts the prompt. Defaults to `150`.
+- `DIALOGFLOW_VAD_MODE`: Optional FreeSWITCH VAD mode passed to `switch_vad_set_mode` (`-1`, `0`, `1`, `2`, `3`). Leave unset for the default native mode.
+- `DIALOGFLOW_VAD_DEBUG`: When `true`, log local VAD transitions used by the barge-in path.
+- `DIALOGFLOW_LOG_BARGE_TIMING`: When `true`, log `playback_to_recog` and `break_to_recog` timing for the first recognition result after each interruptible prompt. Useful for tuning latency and filler handling.
 - `DIALOGFLOW_SPOOL_SEC`: Number of seconds of caller audio to keep on disk for snippet extraction. When set to `0` or unset, spooling is disabled. Recommended default: `20`.
 - `DIALOGFLOW_SPOOL_DIR`: Optional directory for storing spool chunks (default `/tmp/dialogflow-spool`). Ensure the FreeSWITCH user can read/write the path.
 - `DIALOGFLOW_SPOOL_CHUNK_MS`: Optional chunk size in milliseconds for on-disk rotation (default `2000`).
@@ -227,7 +234,9 @@ Ensure disk spooling is enabled (`DIALOGFLOW_SPOOL_SEC>0`) so that
 ### Turn Timing During Playback
 By default, when `DIALOGFLOW_AUTOPLAY` is enabled the module now avoids opening a new Dialogflow turn until the returned agent audio has finished playing. This prevents spurious `no_input` while the caller is listening to long prompts.
 
-- To keep barge-in enabled, set `DIALOGFLOW_BARGE_IN=true`.
+- To keep barge-in enabled with Dialogflow CX semantics, set `DIALOGFLOW_BARGE_IN=true`.
+- If you need a short protected prefix before interruption is accepted, set `DIALOGFLOW_BARGE_IN_NO_BARGE_MS=<ms>`.
+- If your agent should allow interruption but the CX response does not expose `allow_playback_interruption`, you can override this with `DIALOGFLOW_BARGE_IN_FORCE=true`.
 - To revert to legacy async playback (which may start a new turn during playback), set `DIALOGFLOW_AUTOPLAY_SYNC=false`.
 ## Usage
 When using [drachtio-fsrmf](https://www.npmjs.com/package/drachtio-fsmrf), you can access this API command via the api method on the 'endpoint' object.
@@ -390,7 +399,8 @@ Place something like this in your dialplan to start Dialogflow and enable the ne
       <action application="set" data="DIALOGFLOW_TRANSFER_DIALPLAN=XML"/>
 
       <action application="answer"/>
-      <action application="api" data="dialogflow_start ${uuid} myproject:myagent:production en-US welcome"/>
+      <action application="set" data="api_result=${dialogflow_start ${uuid} myproject:myagent:production en-US welcome}"/>
+      <action application="log" data="INFO dialogflow_start => ${api_result}"/>
       <action application="park"/>
     </condition>
   </extension>

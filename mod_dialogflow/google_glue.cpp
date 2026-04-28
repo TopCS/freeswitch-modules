@@ -24,6 +24,7 @@
 #include <cctype>
 #include <ctime>
 #include <memory>
+#include <algorithm>
 #include <inttypes.h>
 
 #include "google/protobuf/duration.pb.h"
@@ -78,6 +79,244 @@ static double samples_to_ms(uint64_t samples, uint32_t sampleRate) {
     }
     double seconds = static_cast<double>(samples) / static_cast<double>(sampleRate);
     return seconds * 1000.0;
+}
+
+static uint64_t current_time_ms() {
+    return switch_micro_time_now() / 1000;
+}
+
+static void set_proto_duration_ms(google::protobuf::Duration* duration, uint64_t ms) {
+    if (!duration) {
+        return;
+    }
+    duration->set_seconds(static_cast<int64_t>(ms / 1000));
+    duration->set_nanos(static_cast<int32_t>((ms % 1000) * 1000000));
+}
+
+static uint16_t read_le16(const unsigned char* p) {
+    return static_cast<uint16_t>(p[0] | (static_cast<uint16_t>(p[1]) << 8));
+}
+
+static uint32_t read_le32(const unsigned char* p) {
+    return static_cast<uint32_t>(p[0] |
+        (static_cast<uint32_t>(p[1]) << 8) |
+        (static_cast<uint32_t>(p[2]) << 16) |
+        (static_cast<uint32_t>(p[3]) << 24));
+}
+
+static bool get_wav_duration_ms(const std::string& audio, uint64_t* durationMs, uint32_t* detectedRate = nullptr) {
+    if (durationMs) {
+        *durationMs = 0;
+    }
+    if (detectedRate) {
+        *detectedRate = 0;
+    }
+    if (audio.size() < 44) {
+        return false;
+    }
+
+    const unsigned char* data = reinterpret_cast<const unsigned char*>(audio.data());
+    if (memcmp(data, "RIFF", 4) != 0 || memcmp(data + 8, "WAVE", 4) != 0) {
+        return false;
+    }
+
+    uint16_t channels = 0;
+    uint16_t bitsPerSample = 0;
+    uint32_t sampleRate = 0;
+    uint32_t dataSize = 0;
+
+    size_t pos = 12;
+    while (pos + 8 <= audio.size()) {
+        const unsigned char* chunk = data + pos;
+        uint32_t chunkSize = read_le32(chunk + 4);
+        size_t next = pos + 8 + chunkSize + (chunkSize % 2);
+        if (next > audio.size()) {
+            break;
+        }
+
+        if (memcmp(chunk, "fmt ", 4) == 0 && chunkSize >= 16) {
+            channels = read_le16(chunk + 10);
+            sampleRate = read_le32(chunk + 12);
+            bitsPerSample = read_le16(chunk + 22);
+        } else if (memcmp(chunk, "data", 4) == 0) {
+            dataSize = chunkSize;
+        }
+
+        pos = next;
+    }
+
+    if (!channels || !sampleRate || !bitsPerSample || !dataSize) {
+        return false;
+    }
+
+    uint32_t bytesPerSample = static_cast<uint32_t>(channels) * static_cast<uint32_t>(bitsPerSample / 8);
+    if (!bytesPerSample) {
+        return false;
+    }
+
+    uint64_t sampleFrames = dataSize / bytesPerSample;
+    if (!sampleFrames) {
+        return false;
+    }
+
+    if (detectedRate) {
+        *detectedRate = sampleRate;
+    }
+    if (durationMs) {
+        *durationMs = (sampleFrames * 1000ULL) / sampleRate;
+    }
+    return true;
+}
+
+static bool get_audio_file_duration_ms(const std::string& path, uint32_t fallbackRate, uint64_t* durationMs, uint32_t* detectedRate = nullptr) {
+    if (durationMs) {
+        *durationMs = 0;
+    }
+    if (detectedRate) {
+        *detectedRate = 0;
+    }
+    if (path.empty()) {
+        return false;
+    }
+
+    switch_file_handle_t fh = {};
+    fh.channels = 1;
+    fh.native_rate = fallbackRate ? fallbackRate : 8000;
+    switch_status_t status = switch_core_file_open(&fh, path.c_str(), fh.channels, fh.native_rate,
+        SWITCH_FILE_FLAG_READ | SWITCH_FILE_DATA_SHORT, NULL);
+    if (status != SWITCH_STATUS_SUCCESS) {
+        switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+            "get_audio_file_duration_ms: switch_core_file_open failed for %s (status=%d rate=%u)\n",
+            path.c_str(), status, fh.native_rate);
+        return false;
+    }
+
+    uint32_t samplerate = fh.samplerate ? fh.samplerate : fallbackRate;
+    uint64_t sampleCount = static_cast<uint64_t>(fh.sample_count ? fh.sample_count : fh.samples_in);
+    switch_core_file_close(&fh);
+
+    if (!samplerate || !sampleCount) {
+        return false;
+    }
+
+    if (detectedRate) {
+        *detectedRate = samplerate;
+    }
+    if (durationMs) {
+        *durationMs = (sampleCount * 1000ULL) / samplerate;
+    }
+    return true;
+}
+
+static void reset_interruptible_playback_state(struct cap_cb* cb) {
+    if (!cb) {
+        return;
+    }
+    cb->interruptible_playback_active = SWITCH_FALSE;
+    cb->interruptible_playback_started_ms = 0;
+    cb->interruptible_playback_no_barge_ms = 0;
+    cb->vad_talking_ms = 0;
+    if (cb->vad) {
+        switch_vad_reset(cb->vad);
+    }
+}
+
+static void arm_interruptible_playback_state(struct cap_cb* cb, uint64_t noBargeInMs) {
+    if (!cb) {
+        return;
+    }
+    cb->interruptible_playback_active = SWITCH_TRUE;
+    cb->interruptible_playback_started_ms = current_time_ms();
+    cb->interruptible_playback_no_barge_ms = noBargeInMs;
+    cb->vad_talking_ms = 0;
+    if (cb->vad) {
+        switch_vad_reset(cb->vad);
+    }
+    cb->last_interruptible_playback_started_ms = cb->interruptible_playback_started_ms;
+    cb->last_local_barge_break_ms = 0;
+    cb->last_first_recognition_ms = 0;
+    cb->awaiting_first_recognition_after_playback = SWITCH_TRUE;
+}
+
+static bool should_log_barge_timing(switch_channel_t* channel) {
+    const char* value = switch_channel_get_variable(channel, "DIALOGFLOW_LOG_BARGE_TIMING");
+    return value ? switch_true(value) : false;
+}
+
+static void maybe_log_barge_timing(struct cap_cb* cb, switch_core_session_t* session, const StreamingRecognitionResult& rr, bool is_eou) {
+    if (!cb || !session) {
+        return;
+    }
+    switch_channel_t* channel = switch_core_session_get_channel(session);
+    if (!channel || !cb->awaiting_first_recognition_after_playback || !cb->last_interruptible_playback_started_ms || !should_log_barge_timing(channel)) {
+        return;
+    }
+
+    uint64_t nowMs = current_time_ms();
+    cb->last_first_recognition_ms = nowMs;
+    cb->awaiting_first_recognition_after_playback = SWITCH_FALSE;
+
+    uint64_t playbackToRecogMs = 0;
+    if (nowMs >= cb->last_interruptible_playback_started_ms) {
+        playbackToRecogMs = nowMs - cb->last_interruptible_playback_started_ms;
+    }
+    uint64_t breakToRecogMs = 0;
+    if (cb->last_local_barge_break_ms && nowMs >= cb->last_local_barge_break_ms) {
+        breakToRecogMs = nowMs - cb->last_local_barge_break_ms;
+    }
+
+    switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO,
+        "Dialogflow barge timing: playback_to_recog=%" PRIu64 "ms break_to_recog=%" PRIu64 "ms local_break=%s final=%s eou=%s transcript='%s'\n",
+        playbackToRecogMs,
+        breakToRecogMs,
+        cb->last_local_barge_break_ms ? "true" : "false",
+        rr.is_final() ? "true" : "false",
+        is_eou ? "true" : "false",
+        rr.transcript().c_str());
+}
+
+static bool response_allows_playback_interruption(const StreamingDetectIntentResponse& response) {
+    if (!response.has_detect_intent_response()) {
+        return false;
+    }
+
+    const auto& dir = response.detect_intent_response();
+    if (!dir.has_query_result()) {
+        return false;
+    }
+
+    const auto& messages = dir.query_result().response_messages();
+    for (const auto& message : messages) {
+        if (message.has_output_audio_text() && message.output_audio_text().allow_playback_interruption()) {
+            return true;
+        }
+        if (message.has_play_audio() && message.play_audio().allow_playback_interruption()) {
+            return true;
+        }
+        if (message.has_text() && message.text().allow_playback_interruption()) {
+            return true;
+        }
+        if (message.has_mixed_audio()) {
+            for (const auto& segment : message.mixed_audio().segments()) {
+                if (segment.allow_playback_interruption()) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    return false;
+}
+
+static void stop_playback(switch_core_session_t* session) {
+    const char* suuid = switch_core_session_get_uuid(session);
+    char args[256];
+    switch_stream_handle_t stream = { 0 };
+
+    snprintf(args, sizeof(args), "%s all", suuid ? suuid : "");
+    SWITCH_STANDARD_STREAM(stream);
+    (void) switch_api_execute("uuid_break", args, NULL, &stream);
+    switch_safe_free(stream.data);
 }
 
 // Forward declaration for internal stop helper defined later in this file
@@ -647,12 +886,13 @@ public:
         qi->clear_event();
         qi->clear_intent();
         auto* ai = qi->mutable_audio();
-        bool sendConfig = m_needConfig.exchange(false);
+		bool sendConfig = m_needConfig.exchange(false);
         if (sendConfig) {
             auto* audio_config = ai->mutable_config();
             audio_config->set_sample_rate_hertz((int)m_sampleRate);
             audio_config->set_audio_encoding(AudioEncoding::AUDIO_ENCODING_LINEAR_16);
             audio_config->set_single_utterance(true);
+            maybeApplyPendingBargeIn(audio_config, session, "GStreamer::write");
             switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "GStreamer::write sent new audio config to start next turn\n");
             // Mark start of a new turn when sending a fresh audio config
             markTurnStart();
@@ -703,6 +943,22 @@ public:
 
     void setNeedConfig() {
         m_needConfig.store(true);
+    }
+
+    void setPendingBargeIn(uint64_t totalDurationMs, uint64_t noBargeInDurationMs) {
+        if (!totalDurationMs) {
+            clearPendingBargeIn();
+            return;
+        }
+        m_pendingBargeIn.store(true);
+        m_pendingBargeInTotalMs = totalDurationMs;
+        m_pendingBargeInNoBargeMs = std::min(noBargeInDurationMs, totalDurationMs);
+    }
+
+    void clearPendingBargeIn() {
+        m_pendingBargeIn.store(false);
+        m_pendingBargeInTotalMs = 0;
+        m_pendingBargeInNoBargeMs = 0;
     }
 
     void setPaused(bool paused) {
@@ -767,10 +1023,11 @@ public:
 
         auto* qi = m_request->mutable_query_input();
         auto* audio_input = qi->mutable_audio();
-            auto* audio_config = audio_input->mutable_config();
-            audio_config->set_sample_rate_hertz((int)m_sampleRate);
-            audio_config->set_audio_encoding(AudioEncoding::AUDIO_ENCODING_LINEAR_16);
-            audio_config->set_single_utterance(true);
+        auto* audio_config = audio_input->mutable_config();
+        audio_config->set_sample_rate_hertz((int)m_sampleRate);
+        audio_config->set_audio_encoding(AudioEncoding::AUDIO_ENCODING_LINEAR_16);
+        audio_config->set_single_utterance(true);
+        maybeApplyPendingBargeIn(audio_config, session, "GStreamer::rotateToAudioConfig");
         qi->set_language_code(m_lang.c_str());
 
         // Always request output audio
@@ -809,6 +1066,7 @@ public:
         // Also expose the logical channel as a channel var for headers, if present
         if (!m_qpChannel.empty()) switch_channel_set_variable(channel, "DF_CHANNEL", m_qpChannel.c_str());
 
+        m_needConfig.store(false);
         m_streamer = m_stub->StreamingDetectIntent(m_context.get());
         // Mark start of the new audio-configured turn
         markTurnStart();
@@ -817,6 +1075,21 @@ public:
     }
 
 private:
+    void maybeApplyPendingBargeIn(InputAudioConfig* audio_config, switch_core_session_t* session, const char* context) {
+        if (!audio_config || !m_pendingBargeIn.exchange(false)) {
+            return;
+        }
+
+        auto* config = audio_config->mutable_barge_in_config();
+        set_proto_duration_ms(config->mutable_no_barge_in_duration(), m_pendingBargeInNoBargeMs);
+        set_proto_duration_ms(config->mutable_total_duration(), m_pendingBargeInTotalMs);
+        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO,
+            "%s applying Dialogflow barge_in_config total=%" PRIu64 "ms no_barge=%" PRIu64 "ms\n",
+            context, m_pendingBargeInTotalMs, m_pendingBargeInNoBargeMs);
+        m_pendingBargeInTotalMs = 0;
+        m_pendingBargeInNoBargeMs = 0;
+    }
+
     std::string m_sessionId;
     std::shared_ptr<grpc::ClientContext> m_context;
     std::shared_ptr<grpc::Channel> m_channel;
@@ -849,6 +1122,9 @@ private:
     uint64_t m_totalSamples;
     uint64_t m_turnStartSample;
     uint64_t m_turnIndex;
+    std::atomic<bool> m_pendingBargeIn{false};
+    uint64_t m_pendingBargeInTotalMs{0};
+    uint64_t m_pendingBargeInNoBargeMs{0};
     // Turn timing
     uint64_t m_turnStartMs = 0;
     uint64_t m_finalRecogMs = 0;
@@ -862,6 +1138,10 @@ static void killcb(struct cap_cb* cb) {
 			GStreamer* p = (GStreamer *) cb->streamer;
 			delete p;
 			cb->streamer = NULL;
+		}
+		if (cb->vad) {
+			switch_vad_destroy(&cb->vad);
+			cb->vad = NULL;
 		}
 		if (cb->resampler) {
 				speex_resampler_destroy(cb->resampler);
@@ -902,6 +1182,18 @@ static void *SWITCH_THREAD_FUNC grpc_read_thread(switch_thread_t *thread, void *
                     const auto& rr = response.recognition_result();
                     auto o = rr.message_type();
                     bool is_eou = (0 == StreamingRecognitionResult::MessageType_Name(o).compare("END_OF_SINGLE_UTTERANCE"));
+                    if (is_eou || rr.is_final() || !rr.transcript().empty()) {
+                        maybe_log_barge_timing(cb, psession, rr, is_eou);
+                    }
+                    if (cb->interruptible_playback_active && (is_eou || rr.is_final() || !rr.transcript().empty())) {
+                        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(psession), SWITCH_LOG_INFO,
+                            "grpc_read_thread: barge-in detected, stopping active playback (final=%s transcript='%s' eou=%s)\n",
+                            rr.is_final() ? "true" : "false",
+                            rr.transcript().c_str(),
+                            is_eou ? "true" : "false");
+                        stop_playback(psession);
+                        reset_interruptible_playback_state(cb);
+                    }
                     if (is_eou) {
                         type = DIALOGFLOW_EVENT_END_OF_UTTERANCE;
                         streamer->markEOU();
@@ -1055,23 +1347,25 @@ static void *SWITCH_THREAD_FUNC grpc_read_thread(switch_thread_t *thread, void *
                     "grpc_read_thread: detect_intent_response output_audio bytes=%zu config? %s\n",
                     audio.size(), dir.has_output_audio_config() ? "yes" : "no");
                 // Decide if we should barge-in or block the next user turn during playback
-                bool allow_barge_in = switch_true(switch_channel_get_variable(channel, "DIALOGFLOW_BARGE_IN"));
+                bool requested_barge_in = switch_true(switch_channel_get_variable(channel, "DIALOGFLOW_BARGE_IN"));
+                bool force_barge_in = switch_true(switch_channel_get_variable(channel, "DIALOGFLOW_BARGE_IN_FORCE"));
+                bool response_barge_in = response_allows_playback_interruption(response);
+                bool allow_barge_in = requested_barge_in && (response_barge_in || force_barge_in);
                 bool will_autoplay = switch_true(switch_channel_get_variable(channel, "DIALOGFLOW_AUTOPLAY"));
                 bool autoplay_sync = switch_true(switch_channel_get_variable(channel, "DIALOGFLOW_AUTOPLAY_SYNC"));
                 // Default to sync when AUTOPLAY is requested unless explicitly disabled
                 if (will_autoplay && switch_channel_get_variable(channel, "DIALOGFLOW_AUTOPLAY_SYNC") == NULL) {
                     autoplay_sync = true;
                 }
+                if (requested_barge_in && !allow_barge_in) {
+                    switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(psession), SWITCH_LOG_INFO,
+                        "grpc_read_thread: Dialogflow response is not interruptible; keeping playback blocking for this turn\n");
+                }
                 if (!allow_barge_in && will_autoplay && autoplay_sync && playAudio) {
                     // Pause streaming while we play the agent audio; we will resume afterwards
                     streamer->setPaused(true);
                     switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(psession), SWITCH_LOG_DEBUG,
                         "grpc_read_thread: pausing input during sync autoplay (barge-in disabled)\n");
-                } else {
-                    // Arm next listening turn now; audio config will be sent on next frame
-                    streamer->setNeedConfig();
-                    switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(psession), SWITCH_LOG_DEBUG,
-                        "grpc_read_thread: arming next turn; will send new audio config on next frame\n");
                 }
 
                 // Handle auto actions: end-session / transfer-to-human based on intent name or parameters
@@ -1433,11 +1727,71 @@ static void *SWITCH_THREAD_FUNC grpc_read_thread(switch_thread_t *thread, void *
 				const char* ap = switch_channel_get_variable(channel, "DIALOGFLOW_AUTOPLAY");
 				bool will_autoplay = ap && switch_true(ap);
 				bool autoplay_sync = switch_true(switch_channel_get_variable(channel, "DIALOGFLOW_AUTOPLAY_SYNC"));
+                bool requested_barge_in = switch_true(switch_channel_get_variable(channel, "DIALOGFLOW_BARGE_IN"));
+                bool force_barge_in = switch_true(switch_channel_get_variable(channel, "DIALOGFLOW_BARGE_IN_FORCE"));
+                bool response_barge_in = response_allows_playback_interruption(response);
+                bool allow_barge_in = requested_barge_in && (response_barge_in || force_barge_in);
+                uint64_t promptDurationMs = 0;
+                uint32_t promptSampleRate = 0;
+                uint64_t noBargeInMs = 0;
+                const OutputAudioConfig* promptCfg = (response.has_detect_intent_response() && response.detect_intent_response().has_output_audio_config())
+                    ? &response.detect_intent_response().output_audio_config() : NULL;
 				if (will_autoplay && switch_channel_get_variable(channel, "DIALOGFLOW_AUTOPLAY_SYNC") == NULL) {
 					autoplay_sync = true; // default to sync to avoid no_input during long prompts
 				}
+                if (allow_barge_in) {
+                    const char* nb = switch_channel_get_variable(channel, "DIALOGFLOW_BARGE_IN_NO_BARGE_MS");
+                    if (nb && *nb) {
+                        noBargeInMs = static_cast<uint64_t>(strtoull(nb, NULL, 10));
+                    }
+                    bool haveDuration = false;
+                    if (promptCfg && promptCfg->audio_encoding() == OutputAudioEncoding::OUTPUT_AUDIO_ENCODING_LINEAR_16) {
+                        haveDuration = get_wav_duration_ms(audio, &promptDurationMs, &promptSampleRate);
+                        if (haveDuration) {
+                            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(psession), SWITCH_LOG_INFO,
+                                "Dialogflow native barge-in duration derived from WAV payload: total=%" PRIu64 "ms rate=%uHz\n",
+                                promptDurationMs, promptSampleRate);
+                        }
+                    }
+                    if (!haveDuration) {
+                        haveDuration = get_audio_file_duration_ms(s.str(), streamer->sampleRate(), &promptDurationMs, &promptSampleRate);
+                    }
+                    if (!haveDuration) {
+                        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(psession), SWITCH_LOG_WARNING,
+                            "Unable to determine prompt duration for native Dialogflow barge-in; falling back to blocking playback for %s\n",
+                            s.str().c_str());
+                        allow_barge_in = false;
+                        if (autoplay_sync) {
+                            switch_mutex_lock(cb->mutex);
+                            streamer->setPaused(true);
+                            switch_mutex_unlock(cb->mutex);
+                        }
+                    } else {
+                        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(psession), SWITCH_LOG_INFO,
+                            "Dialogflow native barge-in armed for %s: total=%" PRIu64 "ms no_barge=%" PRIu64 "ms rate=%uHz\n",
+                            s.str().c_str(), promptDurationMs, noBargeInMs, promptSampleRate);
+                    }
+                }
                 if (will_autoplay && !cb->stopping) {
-                    if (autoplay_sync) {
+                    if (allow_barge_in) {
+                        if (!cb->stopping && switch_channel_ready(channel)) {
+                            switch_mutex_lock(cb->mutex);
+                            arm_interruptible_playback_state(cb, noBargeInMs);
+                            streamer->setPendingBargeIn(promptDurationMs, noBargeInMs);
+                            if (streamer->isPaused()) streamer->setPaused(false);
+                            streamer->rotateToAudioConfig(psession);
+                            switch_mutex_unlock(cb->mutex);
+                        }
+                        char args[1024];
+                        snprintf(args, sizeof(args), "%s %s aleg", cb->sessionId, s.str().c_str());
+                        switch_stream_handle_t stream = { 0 };
+                        SWITCH_STANDARD_STREAM(stream);
+                        switch_status_t st = switch_api_execute("uuid_broadcast", args, NULL, &stream);
+                        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(psession), SWITCH_LOG_INFO,
+                            "Auto-playing Dialogflow audio in interruptible mode via uuid_broadcast: %s (status=%d)\n", args, st);
+                        switch_safe_free(stream.data);
+                    } else if (autoplay_sync) {
+                        reset_interruptible_playback_state(cb);
                         // Play synchronously so we know when it finishes
                         switch_status_t st = switch_ivr_play_file(psession, NULL, s.str().c_str(), NULL);
                         switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(psession), SWITCH_LOG_INFO,
@@ -1457,13 +1811,20 @@ static void *SWITCH_THREAD_FUNC grpc_read_thread(switch_thread_t *thread, void *
                             }
                         }
                         // Resume streaming and rotate to a fresh audio-configured stream for next user turn
-                        if (!cb->stopping && switch_channel_ready(channel)) {
+                        if (!allow_barge_in && !cb->stopping && switch_channel_ready(channel)) {
                             switch_mutex_lock(cb->mutex);
                             streamer->setPaused(false);
                             streamer->rotateToAudioConfig(psession);
                             switch_mutex_unlock(cb->mutex);
                         }
                     } else {
+                        reset_interruptible_playback_state(cb);
+                        if (!cb->stopping && switch_channel_ready(channel)) {
+                            switch_mutex_lock(cb->mutex);
+                            if (streamer->isPaused()) streamer->setPaused(false);
+                            streamer->rotateToAudioConfig(psession);
+                            switch_mutex_unlock(cb->mutex);
+                        }
                         // Fallback: async broadcast (legacy behavior)
                         char args[1024];
                         snprintf(args, sizeof(args), "%s %s aleg", cb->sessionId, s.str().c_str());
@@ -1473,15 +1834,9 @@ static void *SWITCH_THREAD_FUNC grpc_read_thread(switch_thread_t *thread, void *
                         switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(psession), SWITCH_LOG_INFO,
                             "Auto-playing Dialogflow audio via uuid_broadcast: %s (status=%d)\n", args, st);
                         switch_safe_free(stream.data);
-                        // Rotate immediately to begin listening during async playback
-                        if (!cb->stopping && switch_channel_ready(channel)) {
-                            switch_mutex_lock(cb->mutex);
-                            if (streamer->isPaused()) streamer->setPaused(false);
-                            streamer->rotateToAudioConfig(psession);
-                            switch_mutex_unlock(cb->mutex);
-                        }
                     }
                 } else {
+                    reset_interruptible_playback_state(cb);
                     // Not auto-playing here. If we paused earlier, resume and rotate now.
                     if (!cb->stopping && switch_channel_ready(channel)) {
                         switch_mutex_lock(cb->mutex);
@@ -1491,6 +1846,20 @@ static void *SWITCH_THREAD_FUNC grpc_read_thread(switch_thread_t *thread, void *
                     }
                 }
 			}
+            else if (response.has_detect_intent_response() && !cb->stopping) {
+                reset_interruptible_playback_state(cb);
+                if (!switch_channel_ready(channel)) {
+                    switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(psession), SWITCH_LOG_WARNING,
+                        "Channel not ready during DF detect_intent_response without audio; exiting read loop\n");
+                    switch_core_session_rwunlock(psession);
+                    return NULL;
+                }
+                switch_mutex_lock(cb->mutex);
+                if (streamer->isPaused()) streamer->setPaused(false);
+                streamer->clearPendingBargeIn();
+                streamer->rotateToAudioConfig(psession);
+                switch_mutex_unlock(cb->mutex);
+            }
 			switch_core_session_rwunlock(psession);
 		}
 		else {
@@ -1569,6 +1938,9 @@ extern "C" {
 		switch_status_t status = SWITCH_STATUS_SUCCESS;
 		switch_channel_t *channel = switch_core_session_get_channel(session);
 		int err;
+		const char* vadEnabled = NULL;
+		const char* vadHold = NULL;
+		const char* vadMode = NULL;
 		switch_threadattr_t *thd_attr = NULL;
 		switch_memory_pool_t *pool = switch_core_session_get_pool(session);
 		struct cap_cb* cb = (struct cap_cb *) switch_core_session_alloc(session, sizeof(*cb));
@@ -1590,6 +1962,18 @@ extern "C" {
 		cb->responseHandler = responseHandler;
 		cb->errorHandler = errorHandler;
 		cb->stopping = SWITCH_FALSE;
+		cb->vad = NULL;
+		cb->interruptible_playback_active = SWITCH_FALSE;
+		cb->barge_vad_enabled = SWITCH_TRUE;
+		cb->vad_debug = SWITCH_FALSE;
+		cb->barge_vad_hold_ms = 150;
+		cb->interruptible_playback_started_ms = 0;
+		cb->interruptible_playback_no_barge_ms = 0;
+		cb->vad_talking_ms = 0;
+		cb->last_interruptible_playback_started_ms = 0;
+		cb->last_local_barge_break_ms = 0;
+		cb->last_first_recognition_ms = 0;
+		cb->awaiting_first_recognition_after_playback = SWITCH_FALSE;
 
 		if (switch_mutex_init(&cb->mutex, SWITCH_MUTEX_NESTED, pool) != SWITCH_STATUS_SUCCESS) {
 			switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "Error initializing mutex\n");
@@ -1648,6 +2032,31 @@ extern "C" {
 						switch_channel_get_name(channel), speex_resampler_strerror(err));
 			status = SWITCH_STATUS_FALSE;
 			goto done;
+		}
+		vadEnabled = switch_channel_get_variable(channel, "DIALOGFLOW_BARGE_VAD");
+		cb->barge_vad_enabled = (vadEnabled == NULL) ? SWITCH_TRUE : switch_true(vadEnabled);
+		vadHold = switch_channel_get_variable(channel, "DIALOGFLOW_BARGE_VAD_HOLD_MS");
+		if (!zstr(vadHold)) {
+			int hold = atoi(vadHold);
+			if (hold > 0) {
+				cb->barge_vad_hold_ms = (uint32_t) hold;
+			}
+		}
+		cb->vad_debug = switch_true(switch_channel_get_variable(channel, "DIALOGFLOW_VAD_DEBUG"));
+		if (cb->barge_vad_enabled) {
+			cb->vad = switch_vad_init((int)((GStreamer*)cb->streamer)->sampleRate(), 1);
+			if (cb->vad) {
+				vadMode = switch_channel_get_variable(channel, "DIALOGFLOW_VAD_MODE");
+				switch_vad_set_mode(cb->vad, zstr(vadMode) ? -1 : atoi(vadMode));
+				if (cb->vad_debug) {
+					switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO,
+						"Dialogflow using FreeSWITCH VAD mode=%s hold=%ums\n",
+						zstr(vadMode) ? "-1" : vadMode, cb->barge_vad_hold_ms);
+				}
+			} else {
+				switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING,
+					"Unable to initialize FreeSWITCH VAD for local barge-in; relying on Dialogflow recognition only\n");
+			}
 		}
 
 		// hangup hook to clear temp audio files
@@ -1757,6 +2166,7 @@ extern "C" {
 		uint8_t data[SWITCH_RECOMMENDED_BUFFER_SIZE];
 		switch_frame_t frame = {};
 		struct cap_cb *cb = (struct cap_cb *) user_data;
+		switch_bool_t stop_interruptible_playback = SWITCH_FALSE;
 
 		frame.data = data;
 		frame.buflen = SWITCH_RECOMMENDED_BUFFER_SIZE;
@@ -1769,9 +2179,44 @@ extern "C" {
 						spx_int16_t out[SWITCH_RECOMMENDED_BUFFER_SIZE];
 						spx_uint32_t out_len = SWITCH_RECOMMENDED_BUFFER_SIZE;
 						spx_uint32_t in_len = frame.samples;
-						size_t written;
 						
 						speex_resampler_process_interleaved_int(cb->resampler, (const spx_int16_t *) frame.data, (spx_uint32_t *) &in_len, &out[0], &out_len);
+						if (cb->interruptible_playback_active && cb->barge_vad_enabled && cb->vad && out_len > 0) {
+							switch_vad_state_t vadState = switch_vad_process(cb->vad, &out[0], (unsigned int) out_len);
+							if (cb->vad_debug &&
+								(vadState == SWITCH_VAD_STATE_START_TALKING || vadState == SWITCH_VAD_STATE_STOP_TALKING)) {
+								switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG,
+									"Dialogflow VAD: %s (talking=%" PRIu64 "ms hold=%ums active=%s)\n",
+									switch_vad_state2str(vadState),
+									cb->vad_talking_ms,
+									cb->barge_vad_hold_ms,
+									cb->interruptible_playback_active ? "true" : "false");
+							}
+							uint64_t elapsedMs = 0;
+							if (cb->interruptible_playback_started_ms) {
+								uint64_t nowMs = current_time_ms();
+								if (nowMs >= cb->interruptible_playback_started_ms) {
+									elapsedMs = nowMs - cb->interruptible_playback_started_ms;
+								}
+							}
+							if (elapsedMs >= cb->interruptible_playback_no_barge_ms) {
+								if (vadState == SWITCH_VAD_STATE_START_TALKING || vadState == SWITCH_VAD_STATE_TALKING) {
+									cb->vad_talking_ms += (uint64_t)(samples_to_ms(out_len, streamer->sampleRate()) + 0.5);
+									if (!stop_interruptible_playback && cb->vad_talking_ms >= cb->barge_vad_hold_ms) {
+										stop_interruptible_playback = SWITCH_TRUE;
+										cb->last_local_barge_break_ms = current_time_ms();
+										reset_interruptible_playback_state(cb);
+										switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO,
+											"google_dialogflow_frame: local VAD barge-in triggered after %" PRIu64 "ms of playback and %" PRIu64 "ms of speech (hold=%ums)\n",
+											elapsedMs, cb->vad_talking_ms, cb->barge_vad_hold_ms);
+									}
+								} else {
+									cb->vad_talking_ms = 0;
+								}
+							} else if (vadState != SWITCH_VAD_STATE_NONE) {
+								cb->vad_talking_ms = 0;
+							}
+						}
 						
 						streamer->write(session, &out[0], sizeof(spx_int16_t) * out_len);
 					}
@@ -1786,7 +2231,10 @@ extern "C" {
 		else {
 			//switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, 
 			//	"google_dialogflow_frame: not sending audio since failed to get lock on mutex\n");
-	}
+		}
+		if (stop_interruptible_playback) {
+			stop_playback(session);
+		}
 	return SWITCH_TRUE;
 }
 

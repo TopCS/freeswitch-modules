@@ -17,11 +17,11 @@
 
       <action application="answer"/>
       <!-- Start Dialogflow on this channel (replace project:agent:environment accordingly) -->
-      <action application="api" data="dialogflow_start ${uuid} myproject:myagent:production en-US welcome"/>
+      <action application="set" data="api_result=${dialogflow_start ${uuid} myproject:myagent:production en-US welcome}"/>
+      <action application="log" data="INFO dialogflow_start => ${api_result}"/>
 
       <!-- Optional: wait here to keep the call alive while Dialogflow drives the flow -->
       <action application="park"/>
     </condition>
   </extension>
 </include>
-

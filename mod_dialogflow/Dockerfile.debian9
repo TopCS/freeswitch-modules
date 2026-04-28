@@ -15,9 +15,6 @@ RUN printf '%s\n' \
     libspeexdsp-dev zlib1g-dev libssl-dev \
  && rm -rf /var/lib/apt/lists/*
 
-# Set GCC/G++ 8 as default
-# Use default GCC from Stretch (GCC 6), target C++14 in grpc and module builds
-
 # Install a recent CMake (>= 3.18) prebuilt
 ENV CMAKE_VERSION=3.25.2
 RUN cd /tmp \

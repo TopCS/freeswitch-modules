@@ -32,7 +32,8 @@ typedef void (*errorHandler_t)(switch_core_session_t* session, const char * reas
 struct cap_cb {
     switch_mutex_t *mutex;
     char sessionId[256];
-  SpeexResamplerState *resampler;
+	switch_vad_t *vad;
+	SpeexResamplerState *resampler;
     void* streamer;
     responseHandler_t responseHandler;
     errorHandler_t errorHandler;
@@ -41,6 +42,17 @@ struct cap_cb {
     char projectId[MAX_PROJECT_ID];
     uint64_t lastTranscriptMs;
     switch_bool_t stopping;
+    switch_bool_t interruptible_playback_active;
+	switch_bool_t barge_vad_enabled;
+	switch_bool_t vad_debug;
+	uint32_t barge_vad_hold_ms;
+	uint64_t interruptible_playback_started_ms;
+	uint64_t interruptible_playback_no_barge_ms;
+	uint64_t vad_talking_ms;
+	uint64_t last_interruptible_playback_started_ms;
+	uint64_t last_local_barge_break_ms;
+	uint64_t last_first_recognition_ms;
+	switch_bool_t awaiting_first_recognition_after_playback;
     char* pending_end_session_json;
 
 };

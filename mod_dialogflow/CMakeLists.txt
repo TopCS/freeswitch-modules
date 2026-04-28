@@ -129,6 +129,10 @@ target_link_libraries(mod_dialogflow PRIVATE
   pthread
 )
 
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 9)
+  target_link_libraries(mod_dialogflow PRIVATE stdc++fs)
+endif()
+
 target_link_options(mod_dialogflow PRIVATE
   ${GRPCPP_LDFLAGS_OTHER}
   ${GRPC_LDFLAGS_OTHER}
@@ -204,6 +208,10 @@ if(BUILD_MOD_CES)
     ${SPEEXDSP_LIBRARIES}
     pthread
   )
+
+  if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 9)
+    target_link_libraries(mod_ces PRIVATE stdc++fs)
+  endif()
 
   target_link_options(mod_ces PRIVATE
     ${GRPCPP_LDFLAGS_OTHER}
