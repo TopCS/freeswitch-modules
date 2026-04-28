@@ -2,6 +2,7 @@
 #define __MOD_CES_H__
 
 #include <switch.h>
+#include <switch_vad.h>
 #include <speex/speex_resampler.h>
 
 #include <unistd.h>

@@ -25,6 +25,7 @@
 SWITCH_MODULE_SHUTDOWN_FUNCTION(mod_ces_shutdown);
 SWITCH_MODULE_RUNTIME_FUNCTION(mod_ces_runtime);
 SWITCH_MODULE_LOAD_FUNCTION(mod_ces_load);
+SWITCH_STANDARD_APP(ces_app_function);
 
 SWITCH_MODULE_DEFINITION(mod_ces, mod_ces_load, mod_ces_shutdown, NULL);
 
@@ -153,6 +154,45 @@ static switch_status_t ces_do_stop(switch_core_session_t *session)
 	}
 
 	return status;
+}
+
+#define CES_APP_START_SYNTAX "project-id app-id location lang-code [event] [text]"
+SWITCH_STANDARD_APP(ces_app_function)
+{
+	char *mydata = NULL, *argv[10] = { 0 };
+	int argc = 0;
+	switch_media_bug_flag_t flags = SMBF_READ_STREAM | SMBF_READ_STREAM | SMBF_READ_PING;
+
+	if (zstr(data)) {
+		switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
+			"ces application requires: %s\n", CES_APP_START_SYNTAX);
+		return;
+	}
+
+	mydata = strdup(data);
+	argc = switch_separate_string(mydata, ' ', argv, (sizeof(argv) / sizeof(argv[0])));
+	if (argc < 4) {
+		switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
+			"ces application requires: %s\n", CES_APP_START_SYNTAX);
+		switch_safe_free(mydata);
+		return;
+	}
+
+	{
+		char *projectId = argv[0];
+		char *appId = argv[1];
+		char *location = argv[2];
+		char *lang = argv[3];
+		char *event = (argc > 4) ? argv[4] : NULL;
+		char *text = (argc > 5) ? argv[5] : NULL;
+		switch_status_t status = ces_start_capture(session, flags, lang, projectId, appId, location, event, text);
+		if (status != SWITCH_STATUS_SUCCESS) {
+			switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
+				"ces application failed to start session\n");
+		}
+	}
+
+	switch_safe_free(mydata);
 }
 
 #define CES_API_START_SYNTAX "<uuid> project-id app-id location lang-code [event] [text]"
@@ -323,6 +363,7 @@ done:
 SWITCH_MODULE_LOAD_FUNCTION(mod_ces_load)
 {
 	switch_api_interface_t *api_interface;
+	switch_application_interface_t *app_interface;
 
 	if (switch_event_reserve_subclass(CES_EVENT_TRANSCRIPTION) != SWITCH_STATUS_SUCCESS) {
 		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Couldn't register subclass %s!\n", CES_EVENT_TRANSCRIPTION);
@@ -365,6 +406,7 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_ces_load)
 	SWITCH_ADD_API(api_interface, "ces_capture", "Capture a caller-side audio snippet for external ASR", ces_api_capture_function, CES_API_CAPTURE_SYNTAX);
 	SWITCH_ADD_API(api_interface, "ces_stop", "Terminate a CES session", ces_api_stop_function, CES_API_STOP_SYNTAX);
 	SWITCH_ADD_API(api_interface, "ces_version", "Show mod_ces version", ces_api_version_function, "");
+	SWITCH_ADD_APP(app_interface, "ces", "Start a CES session on the current channel", "Start a CES session on the current channel", ces_app_function, CES_APP_START_SYNTAX, SAF_NONE);
 	switch_console_set_complete("add ces_stop");
 	switch_console_set_complete("add ces_start project app location lang");
 

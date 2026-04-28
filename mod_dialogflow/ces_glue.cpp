@@ -10,6 +10,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdint>
 #include <cstdlib>
@@ -36,6 +37,12 @@ struct PendingTurnAudio {
 	int32_t turnIndex = -1;
 	std::string bytes;
 };
+
+static bool autoplay_enabled(switch_channel_t* channel);
+static bool autoplay_sync_enabled(switch_channel_t* channel);
+
+static const int DEFAULT_TTS_SILENCE_THRESHOLD = 80;
+static const double DEFAULT_AMBIENT_SKIP_SECONDS = 25.0;
 
 static cJSON* build_error_json(const char* msg, int code, const char* category, bool retryable, const char* details = NULL) {
 	cJSON* json = cJSON_CreateObject();
@@ -140,6 +147,86 @@ static std::string choose_audio_suffix(ces::AudioEncoding encoding) {
 	}
 }
 
+static int read_int_var(switch_channel_t* channel, const char* name, int fallback) {
+	const char* value = switch_channel_get_variable(channel, name);
+	if (zstr(value)) {
+		return fallback;
+	}
+	int parsed = atoi(value);
+	return parsed > 0 ? parsed : fallback;
+}
+
+static double pcm_duration_seconds(const std::string& audio, uint32_t sampleRate) {
+	if (!sampleRate) {
+		return 0.0;
+	}
+	return (double) audio.size() / (double) (sampleRate * 2);
+}
+
+static std::string strip_leading_silence_pcm16(const std::string& audio, uint32_t sampleRate, int threshold) {
+	if (audio.empty() || sampleRate == 0) {
+		return audio;
+	}
+
+	const size_t frameSamples = sampleRate / 50; // 20ms
+	const size_t frameBytes = frameSamples * sizeof(int16_t);
+	size_t offset = 0;
+
+	while (offset + frameBytes <= audio.size()) {
+		const int16_t* frame = reinterpret_cast<const int16_t*>(audio.data() + offset);
+		size_t sampleCount = frameBytes / sizeof(int16_t);
+		int peak = 0;
+		for (size_t i = 0; i < sampleCount; ++i) {
+			int v = frame[i];
+			if (v < 0) v = -v;
+			if (v > peak) peak = v;
+		}
+		if (peak >= threshold) {
+			break;
+		}
+		offset += frameBytes;
+	}
+
+	if (offset >= audio.size()) {
+		return std::string();
+	}
+	return audio.substr(offset);
+}
+
+static bool write_wav_file(const std::string& path, const std::string& audio, uint32_t sampleRate) {
+	std::ofstream file(path, std::ofstream::binary);
+	if (!file.good()) {
+		return false;
+	}
+
+	const uint16_t audioFormat = 1; // PCM
+	const uint16_t channels = 1;
+	const uint16_t bitsPerSample = 16;
+	const uint32_t byteRate = sampleRate * channels * (bitsPerSample / 8);
+	const uint16_t blockAlign = channels * (bitsPerSample / 8);
+	const uint32_t dataSize = static_cast<uint32_t>(audio.size());
+	const uint32_t riffSize = 36 + dataSize;
+
+	file.write("RIFF", 4);
+	file.write(reinterpret_cast<const char*>(&riffSize), sizeof(riffSize));
+	file.write("WAVE", 4);
+	file.write("fmt ", 4);
+
+	const uint32_t fmtChunkSize = 16;
+	file.write(reinterpret_cast<const char*>(&fmtChunkSize), sizeof(fmtChunkSize));
+	file.write(reinterpret_cast<const char*>(&audioFormat), sizeof(audioFormat));
+	file.write(reinterpret_cast<const char*>(&channels), sizeof(channels));
+	file.write(reinterpret_cast<const char*>(&sampleRate), sizeof(sampleRate));
+	file.write(reinterpret_cast<const char*>(&byteRate), sizeof(byteRate));
+	file.write(reinterpret_cast<const char*>(&blockAlign), sizeof(blockAlign));
+	file.write(reinterpret_cast<const char*>(&bitsPerSample), sizeof(bitsPerSample));
+
+	file.write("data", 4);
+	file.write(reinterpret_cast<const char*>(&dataSize), sizeof(dataSize));
+	file.write(audio.data(), static_cast<std::streamsize>(audio.size()));
+	return file.good();
+}
+
 static void stop_playback(switch_core_session_t* session) {
 	const char* suuid = switch_core_session_get_uuid(session);
 	char args[256];
@@ -184,6 +271,10 @@ public:
 		  m_outputEncoding(ces::LINEAR16),
 		  m_started(false),
 		  m_paused(false),
+		  m_vad(NULL),
+		  m_sentEndOfTurnHint(false),
+		  m_ttsSilenceThreshold(DEFAULT_TTS_SILENCE_THRESHOLD),
+		  m_ambientSkipSeconds(DEFAULT_AMBIENT_SKIP_SECONDS),
 		  m_writesDone(false),
 		  m_finishCalled(false) {
 		switch_channel_t* channel = switch_core_session_get_channel(session);
@@ -192,6 +283,7 @@ public:
 		const char* entryAgent = switch_channel_get_variable(channel, "CES_ENTRY_AGENT");
 		const char* textStreaming = switch_channel_get_variable(channel, "CES_ENABLE_TEXT_STREAMING");
 		const char* inputRate = switch_channel_get_variable(channel, "CES_AUDIO_SAMPLE_RATE");
+		const char* ambientSkip = switch_channel_get_variable(channel, "CES_SKIP_AMBIENT_SECONDS");
 		if (!zstr(deployment)) {
 			m_deployment = deployment;
 		}
@@ -203,6 +295,23 @@ public:
 			int overrideRate = atoi(inputRate);
 			if (overrideRate >= 8000 && overrideRate <= 48000) {
 				m_sampleRate = (uint32_t)overrideRate;
+			}
+		}
+		m_ttsSilenceThreshold = read_int_var(channel, "CES_TTS_SILENCE_THRESHOLD", DEFAULT_TTS_SILENCE_THRESHOLD);
+		if (!zstr(ambientSkip)) {
+			double value = atof(ambientSkip);
+			if (value > 0.0) {
+				m_ambientSkipSeconds = value;
+			}
+		}
+		m_vad = switch_vad_init((int)m_sampleRate, 1);
+		if (m_vad) {
+			const char* vadMode = switch_channel_get_variable(channel, "CES_VAD_MODE");
+			switch_vad_set_mode(m_vad, zstr(vadMode) ? -1 : atoi(vadMode));
+			const char* vadDebug = switch_channel_get_variable(channel, "CES_VAD_DEBUG");
+			if (switch_true(vadDebug)) {
+				switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO,
+					"CES using FreeSWITCH VAD mode=%s\n", zstr(vadMode) ? "-1" : vadMode);
 			}
 		}
 
@@ -263,6 +372,9 @@ public:
 
 	~CesStreamer() {
 		try {
+			if (m_vad) {
+				switch_vad_destroy(&m_vad);
+			}
 			m_spool.cleanup();
 		} catch (...) {
 		}
@@ -309,6 +421,21 @@ public:
 			if (!m_streamer->Write(textMsg)) {
 				throw std::runtime_error("failed to send initial CES text input");
 			}
+		} else {
+			switch_channel_t* channel = switch_core_session_get_channel(session);
+			const char* greetingKick = switch_channel_get_variable(channel, "CES_GREETING_KICK_TEXT");
+			const char* greetingKickEnabled = switch_channel_get_variable(channel, "CES_ENABLE_GREETING_KICK");
+			bool enableKick = (greetingKickEnabled == NULL) ? true : switch_true(greetingKickEnabled);
+			if (enableKick) {
+				const char* kickText = zstr(greetingKick) ? "Ciao" : greetingKick;
+				ces::BidiSessionClientMessage textMsg;
+				textMsg.mutable_realtime_input()->set_text(kickText);
+				if (!m_streamer->Write(textMsg)) {
+					throw std::runtime_error("failed to send CES greeting kick text");
+				}
+				switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO,
+					"CES greeting kick text sent: %s\n", kickText);
+			}
 		}
 
 		m_started = true;
@@ -328,8 +455,26 @@ public:
 			return true;
 		}
 
+		bool willContinue = true;
+		if (sampleCount && m_vad) {
+			switch_vad_state_t vadState = switch_vad_process(m_vad, (int16_t*) data, (unsigned int) sampleCount);
+			if (vadState == SWITCH_VAD_STATE_START_TALKING) {
+				m_sentEndOfTurnHint = false;
+				switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG,
+					"CES VAD: %s\n", switch_vad_state2str(vadState));
+			} else if (vadState == SWITCH_VAD_STATE_STOP_TALKING) {
+				if (!m_sentEndOfTurnHint) {
+					willContinue = false;
+					m_sentEndOfTurnHint = true;
+					switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG,
+						"CES VAD: %s, sending will_continue=false\n", switch_vad_state2str(vadState));
+				}
+			}
+		}
+
 		ces::BidiSessionClientMessage inputMsg;
 		inputMsg.mutable_realtime_input()->set_audio(std::string(reinterpret_cast<const char*>(data), datalen));
+		inputMsg.mutable_realtime_input()->set_will_continue(willContinue);
 		return m_streamer->Write(inputMsg);
 	}
 
@@ -388,6 +533,14 @@ public:
 		return m_sampleRate;
 	}
 
+	int ttsSilenceThreshold() const {
+		return m_ttsSilenceThreshold;
+	}
+
+	double ambientSkipSeconds() const {
+		return m_ambientSkipSeconds;
+	}
+
 	void setPaused(bool paused) {
 		m_paused.store(paused);
 	}
@@ -416,6 +569,10 @@ private:
 	AudioSpooler m_spool;
 	bool m_started;
 	std::atomic<bool> m_paused;
+	switch_vad_t* m_vad;
+	bool m_sentEndOfTurnHint;
+	int m_ttsSilenceThreshold;
+	double m_ambientSkipSeconds;
 	bool m_writesDone;
 	std::mutex m_finishMutex;
 	bool m_finishCalled;
@@ -450,14 +607,39 @@ static void emit_json_response(struct ces_cap_cb* cb, switch_core_session_t* ses
 
 static std::string write_turn_audio_file(struct ces_cap_cb* cb, switch_core_session_t* session,
 	CesStreamer* streamer, int32_t turnIndex, const std::string& audio) {
+	std::string processed = audio;
+	if (streamer->outputEncoding() == ces::LINEAR16) {
+		processed = strip_leading_silence_pcm16(audio, streamer->sampleRate(), streamer->ttsSilenceThreshold());
+		if (processed.empty()) {
+			switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO,
+				"CES audio for turn %d was all silence after trimming; skipping file write\n", turnIndex);
+			return std::string();
+		}
+		if (processed.size() != audio.size()) {
+			switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO,
+				"CES trimmed leading silence for turn %d: %zu -> %zu bytes\n",
+				turnIndex, audio.size(), processed.size());
+		}
+	}
+
 	std::ostringstream path;
 	path << SWITCH_GLOBAL_dirs.temp_dir << SWITCH_PATH_SEPARATOR
 	     << cb->sessionId << "_" << turnIndex << "_" << (switch_micro_time_now() / 1000)
 	     << choose_audio_suffix(streamer->outputEncoding());
 
-	std::ofstream file(path.str(), std::ofstream::binary);
-	file << audio;
-	file.close();
+	bool ok = false;
+	if (streamer->outputEncoding() == ces::LINEAR16) {
+		ok = write_wav_file(path.str(), processed, streamer->sampleRate());
+	} else {
+		std::ofstream file(path.str(), std::ofstream::binary);
+		file.write(processed.data(), static_cast<std::streamsize>(processed.size()));
+		ok = file.good();
+	}
+
+	if (!ok) {
+		switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
+			"Unable to write CES audio file %s\n", path.str().c_str());
+	}
 
 	audioFiles.insert(std::pair<std::string, std::string>(cb->sessionId, path.str()));
 	return path.str();
@@ -479,28 +661,22 @@ static bool autoplay_sync_enabled(switch_channel_t* channel) {
 
 static void play_turn_audio(struct ces_cap_cb* cb, switch_core_session_t* session, CesStreamer* streamer, const std::string& path) {
 	switch_channel_t* channel = switch_core_session_get_channel(session);
-	if (!autoplay_enabled(channel)) {
+	bool autoplay = autoplay_enabled(channel);
+	bool autoplaySync = autoplay_sync_enabled(channel);
+	bool bargeIn = switch_true(switch_channel_get_variable(channel, "CES_BARGE_IN"));
+
+	switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO,
+		"CES autoplay decision: autoplay=%s autoplay_sync=%s barge_in=%s path=%s\n",
+		autoplay ? "true" : "false",
+		autoplaySync ? "true" : "false",
+		bargeIn ? "true" : "false",
+		path.c_str());
+
+	if (!autoplay) {
 		return;
 	}
 
-	bool autoplaySync = autoplay_sync_enabled(channel);
-	if (autoplaySync) {
-		switch_mutex_lock(cb->mutex);
-		if (streamer) {
-			streamer->setPaused(true);
-		}
-		switch_mutex_unlock(cb->mutex);
-
-		switch_status_t st = switch_ivr_play_file(session, NULL, path.c_str(), NULL);
-		switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO,
-			"Auto-playing CES audio synchronously: %s (status=%d)\n", path.c_str(), st);
-
-		switch_mutex_lock(cb->mutex);
-		if (streamer) {
-			streamer->setPaused(false);
-		}
-		switch_mutex_unlock(cb->mutex);
-	} else {
+	auto asyncPlayback = [&]() {
 		char args[1024];
 		switch_stream_handle_t stream = { 0 };
 		snprintf(args, sizeof(args), "%s %s aleg", cb->sessionId, path.c_str());
@@ -509,6 +685,37 @@ static void play_turn_audio(struct ces_cap_cb* cb, switch_core_session_t* sessio
 		switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO,
 			"Auto-playing CES audio via uuid_broadcast: %s (status=%d)\n", args, st);
 		switch_safe_free(stream.data);
+	};
+
+	if (autoplaySync) {
+		if (!bargeIn) {
+			switch_mutex_lock(cb->mutex);
+			if (streamer) {
+				streamer->setPaused(true);
+			}
+			switch_mutex_unlock(cb->mutex);
+		}
+
+		switch_status_t st = switch_ivr_play_file(session, NULL, path.c_str(), NULL);
+		switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO,
+			"Auto-playing CES audio synchronously: %s (status=%d)\n", path.c_str(), st);
+
+		if (!bargeIn) {
+			switch_mutex_lock(cb->mutex);
+			if (streamer) {
+				streamer->setPaused(false);
+			}
+			switch_mutex_unlock(cb->mutex);
+		}
+
+		if (st != SWITCH_STATUS_SUCCESS) {
+			switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING,
+				"CES sync autoplay failed (status=%d), falling back to uuid_broadcast for %s\n",
+				st, path.c_str());
+			asyncPlayback();
+		}
+	} else {
+		asyncPlayback();
 	}
 }
 
@@ -519,6 +726,11 @@ static void flush_turn_audio(struct ces_cap_cb* cb, switch_core_session_t* sessi
 	}
 
 	std::string path = write_turn_audio_file(cb, session, streamer, pending->turnIndex, pending->bytes);
+	if (path.empty()) {
+		pending->turnIndex = -1;
+		pending->bytes.clear();
+		return;
+	}
 	cJSON* json = cJSON_CreateObject();
 	cJSON_AddStringToObject(json, "path", path.c_str());
 	cJSON_AddNumberToObject(json, "turn_index", pending->turnIndex);
@@ -572,6 +784,13 @@ static void *SWITCH_THREAD_FUNC ces_grpc_read_thread(switch_thread_t *thread, vo
 		if (response.has_session_output()) {
 			const auto& output = response.session_output();
 			if (output.has_audio()) {
+				double duration = pcm_duration_seconds(output.audio(), streamer->sampleRate());
+				bool hasText = output.has_text() && !output.text().empty();
+				if (duration > streamer->ambientSkipSeconds() && !hasText) {
+					switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(psession), SWITCH_LOG_INFO,
+						"CES skipping ambient audio chunk for turn %d: %.1fs without text (%zu bytes)\n",
+						output.turn_index(), duration, output.audio().size());
+				} else {
 				int32_t turnIndex = output.turn_index();
 				if (pendingAudio.turnIndex >= 0 && pendingAudio.turnIndex != turnIndex && !pendingAudio.bytes.empty()) {
 					flush_turn_audio(cb, psession, streamer, &pendingAudio, autoplay_enabled(channel));
@@ -580,6 +799,7 @@ static void *SWITCH_THREAD_FUNC ces_grpc_read_thread(switch_thread_t *thread, vo
 					pendingAudio.turnIndex = turnIndex;
 				}
 				pendingAudio.bytes.append(output.audio());
+				}
 			}
 
 			if (should_emit_response_event(response)) {
@@ -596,7 +816,9 @@ static void *SWITCH_THREAD_FUNC ces_grpc_read_thread(switch_thread_t *thread, vo
 		}
 
 		if (response.has_interruption_signal()) {
-			stop_playback(psession);
+			if (response.interruption_signal().barge_in()) {
+				stop_playback(psession);
+			}
 			cJSON* json = CESParser::parse(response);
 			emit_json_response(cb, psession, CES_EVENT_INTERRUPTION, json);
 			cJSON_Delete(json);
@@ -755,6 +977,7 @@ switch_status_t ces_session_stop(switch_core_session_t *session, int channelIsCl
 		cb->stopping = SWITCH_TRUE;
 		CesStreamer* streamer = static_cast<CesStreamer*>(cb->streamer);
 		if (streamer) {
+			stop_playback(session);
 			streamer->cancel();
 			streamer->writesDone();
 		}
