@@ -69,6 +69,22 @@ dialogflow_version
 Prints the module version, git hash, build date and build type, e.g.:
 `mod_dialogflow/1.0.0 (git a1b2c3d, built 2025-08-14T10:22:33Z, Release)`
 
+#### Backchannel event (ESL)
+The module subscribes to the `CUSTOM` subclass `mod_dialogflow::backchannel`, so the orchestrator does not need to relay these commands. The backend that knows the operation lifecycle (e.g. Node-RED) sends events over ESL:
+
+```text
+sendevent CUSTOM
+Event-Subclass: mod_dialogflow::backchannel
+Unique-ID: <freeswitch-channel-uuid>
+Action: start
+Operation: lookup
+
+```
+
+Use `Operation: lookup` for a claim, license plate, or other data lookup, and `Operation: payments` for payment details. Enable Cloud Text-to-Speech and grant the module credentials permission to use it. The module synthesizes short operation-specific phrases using the voice, language, speaking rate, pitch, volume, and effects profile selected by `dialogflow_start`; it caches resulting WAV files by voice, phrase, and settings, and warms the first phrase for each operation in the background when the session starts. While the operation remains pending, it cycles through varied short phrases at irregular 9–12 second intervals, synthesizing the next phrase while the current one plays. Send another event with the same `Event-Subclass`, `Unique-ID`, and `Action: stop` when the operation completes. The module also stops playback on caller speech when local barge VAD is enabled and before playing a Dialogflow response.
+
+For a fixed audio prompt, send `Audio-File: /var/lib/freeswitch/sounds/backchannel.wav` instead of `Operation`; the one-shot `dialogflow_backchannel <uuid> start <audio-file>` / `dialogflow_backchannel <uuid> stop` API remains available. Operation playback can also be controlled with `dialogflow_backchannel <uuid> start-operation <lookup|payments>`.
+
 ### Events
 * `dialogflow::intent` - a dialogflow [intent](https://dialogflow.com/docs/intents) has been detected.
 * `dialogflow::transcription` - a transcription has been returned (suppressed if `DIALOGFLOW_TRANSCRIPT_FINAL_ONLY=true` and interim).
@@ -141,6 +157,7 @@ if (typeof data?.body === 'string' && data.body.trim().startsWith('{')) {
 - `DIALOGFLOW_PARAMS`: Optional JSON string merged into `QueryParameters.parameters` on start.
 - `DIALOGFLOW_AUTOPLAY`: If `true`, auto-play returned TTS on the A-leg.
 - `DIALOGFLOW_AUTOPLAY_SYNC`: When `true` and `DIALOGFLOW_AUTOPLAY` is enabled, play the agent audio synchronously and block the next user turn until playback completes. Defaults to `true` when `DIALOGFLOW_AUTOPLAY` is set. Set to `false` to retain legacy async `uuid_broadcast` behavior.
+- `dialogflow_backchannel <uuid> start <audio-file>` starts a one-shot local prompt asynchronously on the A-leg. `start-operation <lookup|payments>` instead synthesizes and alternates short phrases using the session's configured Dialogflow voice. The generated audio is cached in `/tmp` per voice, language, phrase, and speech settings; the first phrase for each operation is warmed asynchronously after session startup. Both modes stop when requested, on caller speech when local barge VAD is enabled, or before an incoming Dialogflow response is played. Playback uses the normal FreeSWITCH audio path, not `uuid_displace`.
 - `DIALOGFLOW_BARGE_IN`: When `true`, enable Dialogflow CX barge-in for interruptible prompts during autoplay. For synchronous autoplay, the module starts the next CX stream before playback and sends `InputAudioConfig.barge_in_config` using the actual prompt duration. Defaults to `false`.
 - `DIALOGFLOW_BARGE_IN_NO_BARGE_MS`: Optional initial guard window in milliseconds for the native CX barge-in config. Defaults to `0`.
 - `DIALOGFLOW_BARGE_IN_FORCE`: When `true`, force native barge-in even if the Dialogflow response messages do not mark the prompt as interruptible via `allow_playback_interruption`. Defaults to `false`.
@@ -272,7 +289,7 @@ dialogflow_start <uuid> myproj:myagent::us:::en-US-Neural2-C en-US
 ## Standalone Build (CMake)
 You can build and install this module without a FreeSWITCH source tree using CMake, similar to mod_audio_stream.
 
-Prereqs: FreeSWITCH dev package (pkg-config provides `freeswitch`), gRPC (`grpc++`, `grpc`), Protobuf (`protobuf`), and generated Google APIs C++ sources.
+Prereqs: FreeSWITCH dev package (pkg-config provides `freeswitch`), gRPC (`grpc++`, `grpc`, and `grpc_cpp_plugin`), Protobuf (`protobuf` and `protoc`), generated Google APIs C++ sources, and the Google APIs proto tree including `google/cloud/texttospeech/v1/cloud_tts.proto` under `GENS_DIR`.
 
 1. Generate/download Google APIs C++ sources and set `GENS_DIR` to the root containing `google/cloud/dialogflow/cx/v3/*.cc` etc.
 2. Configure and build:
@@ -304,7 +321,7 @@ You need build tools, FreeSWITCH dev files (with `freeswitch.pc`), gRPC, Protobu
 If your distro’s gRPC is too old, build from source per official docs: https://grpc.io/docs/languages/cpp/quickstart/
 
 ### Generate Google APIs C++ sources (for GENS_DIR)
-This module compiles against generated C++ from Google APIs protos (Dialogflow CX). You need to generate these once and point `GENS_DIR` at the output root.
+This module compiles against generated C++ from Google APIs protos (Dialogflow CX) and generates the Cloud Text-to-Speech client stubs at build time. Keep the Google APIs proto tree and generated C++ output under `GENS_DIR`.
 
 Prereqs:
 - Protobuf compiler and C++ runtime: `protoc`, `libprotobuf-dev`, `protobuf-compiler`
@@ -315,9 +332,10 @@ Steps:
 - Generate into an output dir, preserving package paths:
 
 ```
-API_ROOT=/path/to/googleapis
 OUT=/absolute/path/to/gens
 mkdir -p "$OUT"
+API_ROOT="$OUT/googleapis-src"
+git clone https://github.com/googleapis/googleapis.git "$API_ROOT"
 
 # Generate Dialogflow CX v3 protos (+ service stubs)
 protoc \

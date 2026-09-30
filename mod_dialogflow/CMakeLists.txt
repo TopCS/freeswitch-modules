@@ -62,6 +62,31 @@ file(GLOB_RECURSE GENS_SOURCES
   "${GENS_DIR}/google/type/*.cc"
 )
 
+find_program(PROTOC_EXECUTABLE protoc REQUIRED)
+find_program(GRPC_CPP_PLUGIN_EXECUTABLE grpc_cpp_plugin REQUIRED)
+set(TTS_PROTO ${GENS_DIR}/googleapis-src/google/cloud/texttospeech/v1/cloud_tts.proto)
+if(NOT EXISTS ${TTS_PROTO})
+  message(FATAL_ERROR "Cloud Text-to-Speech proto not found: ${TTS_PROTO}")
+endif()
+set(TTS_GEN_DIR ${CMAKE_CURRENT_BINARY_DIR}/generated)
+set(TTS_GEN_SOURCES
+  ${TTS_GEN_DIR}/google/cloud/texttospeech/v1/cloud_tts.pb.cc
+  ${TTS_GEN_DIR}/google/cloud/texttospeech/v1/cloud_tts.grpc.pb.cc
+)
+add_custom_command(
+  OUTPUT ${TTS_GEN_SOURCES}
+  COMMAND ${CMAKE_COMMAND} -E make_directory ${TTS_GEN_DIR}/google/cloud/texttospeech/v1
+  COMMAND ${PROTOC_EXECUTABLE}
+          --proto_path=${GENS_DIR}/googleapis-src
+          --proto_path=${GENS_DIR}
+          --cpp_out=${TTS_GEN_DIR}
+          --grpc_out=${TTS_GEN_DIR}
+          --plugin=protoc-gen-grpc=${GRPC_CPP_PLUGIN_EXECUTABLE}
+          ${TTS_PROTO}
+  DEPENDS ${TTS_PROTO}
+  VERBATIM
+)
+
 add_library(mod_dialogflow SHARED
   mod_dialogflow.c
   mod_dialogflow.h
@@ -73,6 +98,7 @@ add_library(mod_dialogflow SHARED
   google_glue.h
   parser.cpp
   parser.h
+  ${TTS_GEN_SOURCES}
   ${GENS_SOURCES}
 )
 
@@ -85,6 +111,7 @@ target_compile_definitions(mod_dialogflow PRIVATE
 
 target_include_directories(mod_dialogflow PRIVATE
   ${GENS_DIR}
+  ${TTS_GEN_DIR}
   ${GRPCPP_INCLUDE_DIRS}
   ${GRPC_INCLUDE_DIRS}
   ${Protobuf_INCLUDE_DIRS}

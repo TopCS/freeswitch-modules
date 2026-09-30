@@ -13,6 +13,8 @@
 #define DIALOGFLOW_INTENT "dialogflow_intent"
 #define DIALOGFLOW_INTENT_AUDIO_FILE "dialogflow_intent_audio_file"
 #define DIALOGFLOW_API_CAPTURE_SYNTAX "<uuid> <start_ms> <duration_ms> [tag]"
+#define DIALOGFLOW_API_BACKCHANNEL_SYNTAX "<uuid> start <audio-file> | <uuid> start-operation <lookup|payments> | <uuid> stop"
+#define DIALOGFLOW_EVENT_BACKCHANNEL "mod_dialogflow::backchannel"
 
 #ifndef MOD_DIALOGFLOW_VERSION
 #define MOD_DIALOGFLOW_VERSION "unknown"
@@ -35,6 +37,94 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_dialogflow_load);
 SWITCH_MODULE_DEFINITION(mod_dialogflow, mod_dialogflow_load, mod_dialogflow_shutdown, NULL);
 
 static switch_status_t do_stop(switch_core_session_t *session);
+static switch_event_node_t *g_backchannel_event_node = NULL;
+static switch_bool_t g_reserved_backchannel = SWITCH_FALSE;
+
+static switch_status_t dialogflow_backchannel_control(switch_core_session_t *session, const char *action, const char *value)
+{
+	switch_channel_t *channel = switch_core_session_get_channel(session);
+	const char *uuid = switch_core_session_get_uuid(session);
+	const char *active = switch_channel_get_variable(channel, "DIALOGFLOW_BACKCHANNEL_ACTIVE");
+	char args[MAX_PATHLEN + 300] = { 0 };
+	switch_stream_handle_t api_stream = { 0 };
+	switch_status_t status = SWITCH_STATUS_FALSE;
+
+	if (!strcmp(action, "start-operation")) {
+		if (zstr(value) || (strcmp(value, "lookup") && strcmp(value, "payments"))) {
+			switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING,
+				"Invalid backchannel operation; expected lookup or payments\n");
+			return SWITCH_STATUS_FALSE;
+		}
+		if (!switch_channel_ready(channel)) return SWITCH_STATUS_FALSE;
+		if (active && switch_true(active)) return SWITCH_STATUS_SUCCESS;
+		switch_channel_set_variable(channel, "DIALOGFLOW_BACKCHANNEL_ACTIVE", "true");
+		status = google_dialogflow_backchannel_start(session, value);
+		if (status != SWITCH_STATUS_SUCCESS) {
+			switch_channel_set_variable(channel, "DIALOGFLOW_BACKCHANNEL_ACTIVE", NULL);
+		}
+	} else if (!strcmp(action, "start")) {
+		if (!value || zstr(value) || strlen(value) > MAX_PATHLEN || strpbrk(value, " \t\r\n")) {
+			switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING,
+				"Invalid backchannel audio file path\n");
+			return SWITCH_STATUS_FALSE;
+		}
+		if (!switch_channel_ready(channel)) {
+			return SWITCH_STATUS_FALSE;
+		}
+		if (active && switch_true(active)) {
+			return SWITCH_STATUS_SUCCESS;
+		}
+		switch_channel_set_variable(channel, "DIALOGFLOW_BACKCHANNEL_ACTIVE", "true");
+		snprintf(args, sizeof(args), "%s %s aleg", uuid, value);
+		SWITCH_STANDARD_STREAM(api_stream);
+		status = switch_api_execute("uuid_broadcast", args, NULL, &api_stream);
+		if (status != SWITCH_STATUS_SUCCESS || (api_stream.data && !strncmp(api_stream.data, "-ERR", 4))) {
+			status = SWITCH_STATUS_FALSE;
+			switch_channel_set_variable(channel, "DIALOGFLOW_BACKCHANNEL_ACTIVE", NULL);
+		}
+	} else if (!strcmp(action, "stop")) {
+		google_dialogflow_backchannel_stop(session);
+		status = SWITCH_STATUS_SUCCESS;
+	}
+
+	switch_safe_free(api_stream.data);
+	return status;
+}
+
+static void dialogflow_backchannel_event_handler(switch_event_t *event)
+{
+	const char *uuid = switch_event_get_header(event, "Unique-ID");
+	const char *action = switch_event_get_header(event, "Action");
+	const char *audio_file = switch_event_get_header(event, "Audio-File");
+	const char *operation = switch_event_get_header(event, "Operation");
+	switch_core_session_t *session;
+	switch_status_t status;
+
+	if (zstr(uuid) || zstr(action) || (strcmp(action, "start") && strcmp(action, "stop")) ||
+		(!strcmp(action, "start") && ((!zstr(audio_file) && !zstr(operation)) || (zstr(audio_file) && zstr(operation))))) {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+			"Ignoring malformed %s event (start requires exactly one of Audio-File or Operation)\n", DIALOGFLOW_EVENT_BACKCHANNEL);
+		return;
+	}
+
+	if (!(session = switch_core_session_locate(uuid))) {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+			"Backchannel event for unknown channel %s\n", uuid);
+		return;
+	}
+
+	status = dialogflow_backchannel_control(session,
+		!strcmp(action, "start") && !zstr(operation) ? "start-operation" : action,
+		!strcmp(action, "start") && !zstr(operation) ? operation : audio_file);
+	if (status == SWITCH_STATUS_SUCCESS) {
+		switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO,
+			"Handled backchannel event action=%s\n", action);
+	} else {
+		switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING,
+			"Failed backchannel event action=%s\n", action);
+	}
+	switch_core_session_rwunlock(session);
+}
 
 static const char* mod_dialogflow_version_str(void) {
     return "mod_dialogflow/" MOD_DIALOGFLOW_VERSION " (git " MOD_DIALOGFLOW_GIT_HASH ", built " MOD_DIALOGFLOW_BUILD_DATE ", " MOD_DIALOGFLOW_BUILD_TYPE ")";
@@ -47,6 +137,42 @@ SWITCH_STANDARD_API(dialogflow_api_version_function)
 }
 
 SWITCH_STANDARD_API(dialogflow_api_capture_function);
+
+SWITCH_STANDARD_API(dialogflow_api_backchannel_function)
+{
+	char *mycmd = NULL, *argv[4] = { 0 };
+	int argc = 0;
+	switch_status_t status = SWITCH_STATUS_FALSE;
+	switch_core_session_t *lsession = NULL;
+
+	if (!zstr(cmd) && (mycmd = strdup(cmd))) {
+		argc = switch_separate_string(mycmd, ' ', argv, (sizeof(argv) / sizeof(argv[0])));
+	}
+
+	if (argc < 2 || argc > 3 || (strcmp(argv[1], "start") && strcmp(argv[1], "start-operation") && strcmp(argv[1], "stop")) ||
+		((!strcmp(argv[1], "start") || !strcmp(argv[1], "start-operation")) && (argc != 3 || zstr(argv[2]))) ||
+		(!strcmp(argv[1], "stop") && argc != 2)) {
+		stream->write_function(stream, "-USAGE: %s\n", DIALOGFLOW_API_BACKCHANNEL_SYNTAX);
+		goto done;
+	}
+
+	if (!(lsession = switch_core_session_locate(argv[0]))) {
+		stream->write_function(stream, "-ERR Channel not found\n");
+		goto done;
+	}
+	status = dialogflow_backchannel_control(lsession, argv[1], argc == 3 ? argv[2] : NULL);
+
+	if (status != SWITCH_STATUS_SUCCESS) {
+		stream->write_function(stream, "-ERR Backchannel operation failed\n");
+	} else {
+		stream->write_function(stream, "+OK Backchannel %s\n", !strcmp(argv[1], "stop") ? "stopped" : "started");
+	}
+
+done:
+	if (lsession) switch_core_session_rwunlock(lsession);
+	switch_safe_free(mycmd);
+	return SWITCH_STATUS_SUCCESS;
+}
 
 static const fs_channel_var_header_map_t k_dialogflow_event_headers[] = {
     { "DF_SESSION_PATH", "DF-Session-Path" },
@@ -420,6 +546,10 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_dialogflow_load)
 		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Couldn't register subclass %s!\n", DIALOGFLOW_EVENT_END_SESSION);
 		return SWITCH_STATUS_TERM;
 	} else g_reserved_end_session = SWITCH_TRUE;
+	if (switch_event_reserve_subclass(DIALOGFLOW_EVENT_BACKCHANNEL) != SWITCH_STATUS_SUCCESS) {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Couldn't register subclass %s!\n", DIALOGFLOW_EVENT_BACKCHANNEL);
+		return SWITCH_STATUS_TERM;
+	} else g_reserved_backchannel = SWITCH_TRUE;
 
 
 	/* connect my internal structure to the blank pointer passed to me */
@@ -435,6 +565,7 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_dialogflow_load)
 
     SWITCH_ADD_API(api_interface, "dialogflow_start", "Start a google dialogflow", dialogflow_api_start_function, DIALOGFLOW_API_START_SYNTAX);
     SWITCH_ADD_API(api_interface, "dialogflow_capture", "Capture a caller-side audio snippet for external ASR", dialogflow_api_capture_function, DIALOGFLOW_API_CAPTURE_SYNTAX);
+    SWITCH_ADD_API(api_interface, "dialogflow_backchannel", "Start or stop a backchannel prompt", dialogflow_api_backchannel_function, DIALOGFLOW_API_BACKCHANNEL_SYNTAX);
     SWITCH_ADD_API(api_interface, "dialogflow_stop", "Terminate a google dialogflow", dialogflow_api_stop_function, DIALOGFLOW_API_STOP_SYNTAX);
     SWITCH_ADD_API(api_interface, "dialogflow_version", "Show mod_dialogflow version", dialogflow_api_version_function, "");
 
@@ -442,6 +573,14 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_dialogflow_load)
 	switch_console_set_complete("add dialogflow_start project lang");
 	switch_console_set_complete("add dialogflow_start project lang timeout-secs");
 	switch_console_set_complete("add dialogflow_start project lang timeout-secs event");
+
+	if (switch_event_bind_removable("mod_dialogflow_backchannel", SWITCH_EVENT_CUSTOM,
+		DIALOGFLOW_EVENT_BACKCHANNEL, dialogflow_backchannel_event_handler, NULL,
+		&g_backchannel_event_node) != SWITCH_STATUS_SUCCESS) {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_CRIT,
+			"Failed to bind %s event listener\n", DIALOGFLOW_EVENT_BACKCHANNEL);
+		return SWITCH_STATUS_TERM;
+	}
 
 	/* indicate that the module should continue to be loaded */
 	return SWITCH_STATUS_SUCCESS;
@@ -452,6 +591,9 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_dialogflow_load)
   Macro expands to: switch_status_t mod_dialogflow_shutdown() */
 SWITCH_MODULE_SHUTDOWN_FUNCTION(mod_dialogflow_shutdown)
 {
+	if (g_backchannel_event_node) {
+		switch_event_unbind(&g_backchannel_event_node);
+	}
 	google_dialogflow_cleanup();
 
 	if (g_reserved_intent) { switch_event_free_subclass(DIALOGFLOW_EVENT_INTENT); g_reserved_intent = SWITCH_FALSE; }
@@ -462,6 +604,7 @@ SWITCH_MODULE_SHUTDOWN_FUNCTION(mod_dialogflow_shutdown)
 	if (g_reserved_error) { switch_event_free_subclass(DIALOGFLOW_EVENT_ERROR); g_reserved_error = SWITCH_FALSE; }
 	if (g_reserved_transfer) { switch_event_free_subclass(DIALOGFLOW_EVENT_TRANSFER); g_reserved_transfer = SWITCH_FALSE; }
 	if (g_reserved_end_session) { switch_event_free_subclass(DIALOGFLOW_EVENT_END_SESSION); g_reserved_end_session = SWITCH_FALSE; }
+	if (g_reserved_backchannel) { switch_event_free_subclass(DIALOGFLOW_EVENT_BACKCHANNEL); g_reserved_backchannel = SWITCH_FALSE; }
     if (g_reserved_webhook_error) { switch_event_free_subclass(DIALOGFLOW_EVENT_WEBHOOK_ERROR); g_reserved_webhook_error = SWITCH_FALSE; }
     if (g_reserved_page) { switch_event_free_subclass(DIALOGFLOW_EVENT_PAGE); g_reserved_page = SWITCH_FALSE; }
 

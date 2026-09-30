@@ -1,4 +1,5 @@
 #include <cstdlib>
+#include <cstdio>
 
 #include <switch.h>
 #include <switch_json.h>
@@ -30,8 +31,10 @@
 #include "google/protobuf/duration.pb.h"
 
 #include "google/cloud/dialogflow/cx/v3/session.grpc.pb.h"
+#include "google/cloud/texttospeech/v1/cloud_tts.grpc.pb.h"
 
 #include "mod_dialogflow.h"
+#include "google_glue.h"
 #include "common/audio_spooler.h"
 #include "parser.h"
 
@@ -48,6 +51,9 @@ using google::cloud::dialogflow::cx::v3::StreamingRecognitionResult;
 using google::cloud::dialogflow::cx::v3::EventInput;
 using google::cloud::dialogflow::cx::v3::OutputAudioEncoding;
 using google::cloud::dialogflow::cx::v3::SsmlVoiceGender;
+using google::cloud::texttospeech::v1::TextToSpeech;
+using google::cloud::texttospeech::v1::SynthesizeSpeechRequest;
+using TtsAudioEncoding = google::cloud::texttospeech::v1::AudioEncoding;
 using google::cloud::dialogflow::cx::v3::QueryParameters;
 using google::rpc::Status;
 using google::protobuf::Struct;
@@ -57,6 +63,25 @@ using google::protobuf::MapPair;
 static uint64_t playCount = 0;
 static std::multimap<std::string, std::string> audioFiles;
 static bool hasDefaultCredentials = false;
+static std::mutex backchannelCacheMutex;
+static std::map<std::string, std::string> backchannelAudioCache;
+static std::mutex backchannelLoopsMutex;
+static std::map<std::string, std::shared_ptr<struct BackchannelLoop>> backchannelLoops;
+static std::mutex backchannelWarmupMutex;
+static std::set<std::string> backchannelWarmupVoices;
+static std::vector<std::thread> backchannelWarmupThreads;
+
+struct BackchannelLoop {
+    std::string uuid;
+    std::string operation;
+    std::string voice;
+    std::string language;
+    std::vector<std::string> audioFiles;
+    std::mutex mutex;
+    std::condition_variable condition;
+    bool stopping = false;
+    bool finished = false;
+};
 
 static uint64_t duration_to_samples(const google::protobuf::Duration& d, uint32_t sampleRate) {
     int64_t seconds = d.seconds();
@@ -319,6 +344,10 @@ static void stop_playback(switch_core_session_t* session) {
     switch_safe_free(stream.data);
 }
 
+static void stop_backchannel(switch_core_session_t* session) {
+    google_dialogflow_backchannel_stop(session);
+}
+
 // Forward declaration for internal stop helper defined later in this file
 extern "C" switch_status_t google_dialogflow_session_stop(switch_core_session_t *session, int channelIsClosing);
 
@@ -562,8 +591,14 @@ public:
             else if (8 == idx && s.length() > 0) m_voiceGender = s;
             else if (9 == idx && s.length() > 0) m_effects = s;
             else if (10 == idx && s.length() > 0) m_sentimentAnalysis = (s == "true");
-            idx++;
-        }
+			idx++;
+		}
+		switch_channel_set_variable(channel, "DIALOGFLOW_TTS_VOICE_NAME", m_voiceName.empty() ? NULL : m_voiceName.c_str());
+		switch_channel_set_variable(channel, "DIALOGFLOW_TTS_LANGUAGE", m_lang.empty() ? NULL : m_lang.c_str());
+		switch_channel_set_variable(channel, "DIALOGFLOW_TTS_SPEAKING_RATE", m_speakingRate ? std::to_string(m_speakingRate).c_str() : NULL);
+		switch_channel_set_variable(channel, "DIALOGFLOW_TTS_PITCH", m_pitch ? std::to_string(m_pitch).c_str() : NULL);
+		switch_channel_set_variable(channel, "DIALOGFLOW_TTS_VOLUME_GAIN_DB", m_volume ? std::to_string(m_volume).c_str() : NULL);
+		switch_channel_set_variable(channel, "DIALOGFLOW_TTS_EFFECTS_PROFILE_ID", m_effects.empty() ? NULL : m_effects.c_str());
 
 		std::string endpoint = "dialogflow.googleapis.com";
 		if (0 != m_regionId.compare("us")) {
@@ -1132,6 +1167,256 @@ private:
     uint64_t m_detectMs = 0;
 };
 
+static std::vector<std::string> backchannel_prompts(const std::string& operation) {
+    if (operation == "lookup") {
+        return {
+            "Attendi mentre recupero i dati.",
+            "Sto ancora verificando le informazioni.",
+            "Ancora un attimo, sto completando il controllo.",
+            "Grazie per l'attesa, controllo gli ultimi dettagli."
+        };
+    }
+    if (operation == "payments") {
+        return {
+            "Attendi mentre recupero i dettagli dei pagamenti.",
+            "Sto ancora verificando le informazioni sui pagamenti.",
+            "Ancora un attimo, sto completando il controllo.",
+            "Grazie per l'attesa, controllo gli ultimi dettagli."
+        };
+    }
+    return {};
+}
+
+static uint64_t backchannel_hash(const std::string& value) {
+    uint64_t hash = 1469598103934665603ULL;
+    for (unsigned char character : value) {
+        hash ^= character;
+        hash *= 1099511628211ULL;
+    }
+    return hash;
+}
+
+static std::shared_ptr<grpc::Channel> create_tts_channel(switch_core_session_t* session) {
+    switch_channel_t* channel = switch_core_session_get_channel(session);
+    const char* credentialValue = switch_channel_get_variable(channel, "GOOGLE_APPLICATION_CREDENTIALS");
+    std::string credentialsInput = credentialValue ? credentialValue : "";
+    std::string credentialsJson = credentialsInput;
+    if (!credentialsInput.empty() && (credentialsInput[0] == '/' ||
+        (credentialsInput.size() >= 5 && credentialsInput.compare(credentialsInput.size() - 5, 5, ".json") == 0))) {
+        std::ifstream credentialsFile(credentialsInput);
+        if (!credentialsFile.good()) {
+            throw std::runtime_error("TTS credentials file is not readable");
+        }
+        credentialsJson.assign(std::istreambuf_iterator<char>(credentialsFile), std::istreambuf_iterator<char>());
+    }
+
+    std::shared_ptr<grpc::ChannelCredentials> channelCredentials;
+    if (!credentialsJson.empty()) {
+        auto callCredentials = grpc::ServiceAccountJWTAccessCredentials(credentialsJson, INT64_MAX);
+        channelCredentials = grpc::CompositeChannelCredentials(
+            grpc::SslCredentials(grpc::SslCredentialsOptions()), callCredentials);
+    } else {
+        channelCredentials = grpc::GoogleDefaultCredentials();
+    }
+    return grpc::CreateChannel("texttospeech.googleapis.com:443", channelCredentials);
+}
+
+static std::string synthesize_backchannel_audio(
+    switch_core_session_t* session,
+    const std::string& voice,
+    const std::string& language,
+    const std::string& phrase) {
+    if (voice.empty() || language.empty() || phrase.empty()) {
+        throw std::runtime_error("TTS voice, language, and phrase are required");
+    }
+
+    switch_channel_t* channel = switch_core_session_get_channel(session);
+    const char* rateValue = switch_channel_get_variable(channel, "DIALOGFLOW_TTS_SPEAKING_RATE");
+    const char* pitchValue = switch_channel_get_variable(channel, "DIALOGFLOW_TTS_PITCH");
+    const char* volumeValue = switch_channel_get_variable(channel, "DIALOGFLOW_TTS_VOLUME_GAIN_DB");
+    const char* effectsValue = switch_channel_get_variable(channel, "DIALOGFLOW_TTS_EFFECTS_PROFILE_ID");
+    std::string cacheKey = voice + "\n" + language + "\n" + phrase + "\n" +
+        (rateValue ? rateValue : "") + "\n" + (pitchValue ? pitchValue : "") + "\n" +
+        (volumeValue ? volumeValue : "") + "\n" + (effectsValue ? effectsValue : "") + "\n8000";
+    {
+        std::lock_guard<std::mutex> cacheLock(backchannelCacheMutex);
+        auto cached = backchannelAudioCache.find(cacheKey);
+        if (cached != backchannelAudioCache.end()) {
+            std::ifstream cachedFile(cached->second, std::ios::binary);
+            if (cachedFile.good()) return cached->second;
+            backchannelAudioCache.erase(cached);
+        }
+    }
+
+    const uint64_t hash = backchannel_hash(cacheKey);
+    char path[256];
+    snprintf(path, sizeof(path), "/tmp/mod_dialogflow_backchannel_%016" PRIx64 ".wav", hash);
+    {
+        std::ifstream existingFile(path, std::ios::binary);
+        if (existingFile.good()) {
+            std::lock_guard<std::mutex> cacheLock(backchannelCacheMutex);
+            backchannelAudioCache[cacheKey] = path;
+            return path;
+        }
+    }
+
+    auto channelHandle = create_tts_channel(session);
+    auto stub = TextToSpeech::NewStub(channelHandle);
+    SynthesizeSpeechRequest request;
+    request.mutable_input()->set_text(phrase);
+    request.mutable_voice()->set_name(voice);
+    request.mutable_voice()->set_language_code(language);
+    auto* audioConfig = request.mutable_audio_config();
+    audioConfig->set_audio_encoding(TtsAudioEncoding::LINEAR16);
+    audioConfig->set_sample_rate_hertz(8000);
+    if (rateValue && *rateValue) audioConfig->set_speaking_rate(atof(rateValue));
+    if (pitchValue && *pitchValue) audioConfig->set_pitch(atof(pitchValue));
+    if (volumeValue && *volumeValue) audioConfig->set_volume_gain_db(atof(volumeValue));
+    if (effectsValue && *effectsValue) audioConfig->add_effects_profile_id(effectsValue);
+
+    grpc::ClientContext context;
+    context.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(5));
+    google::cloud::texttospeech::v1::SynthesizeSpeechResponse response;
+    grpc::Status status = stub->SynthesizeSpeech(&context, request, &response);
+    if (!status.ok()) {
+        throw std::runtime_error("Cloud Text-to-Speech failed: " + status.error_message());
+    }
+    const std::string& audio = response.audio_content();
+    if (audio.size() < 44 || audio.compare(0, 4, "RIFF") != 0 || audio.compare(8, 4, "WAVE") != 0) {
+        throw std::runtime_error("Cloud Text-to-Speech returned invalid LINEAR16 WAV data");
+    }
+
+    std::string temporaryPath = std::string(path) + ".tmp." + std::to_string(switch_micro_time_now());
+    {
+        std::ofstream output(temporaryPath, std::ios::binary | std::ios::trunc);
+        output.write(audio.data(), static_cast<std::streamsize>(audio.size()));
+        if (!output.good()) {
+            std::remove(temporaryPath.c_str());
+            throw std::runtime_error("Unable to write synthesized backchannel audio");
+        }
+    }
+    if (std::rename(temporaryPath.c_str(), path) != 0) {
+        std::remove(temporaryPath.c_str());
+        throw std::runtime_error("Unable to publish synthesized backchannel audio");
+    }
+    {
+        std::lock_guard<std::mutex> cacheLock(backchannelCacheMutex);
+        backchannelAudioCache[cacheKey] = path;
+    }
+    return path;
+}
+
+static void backchannel_broadcast(const std::shared_ptr<BackchannelLoop>& loop, const std::string& path) {
+    switch_core_session_t* session = switch_core_session_locate(loop->uuid.c_str());
+    if (!session) return;
+    switch_channel_t* channel = switch_core_session_get_channel(session);
+    const char* active = switch_channel_get_variable(channel, "DIALOGFLOW_BACKCHANNEL_ACTIVE");
+    if (switch_channel_ready(channel) && active && switch_true(active)) {
+        char args[MAX_PATHLEN + 300];
+        snprintf(args, sizeof(args), "%s %s aleg", loop->uuid.c_str(), path.c_str());
+        switch_stream_handle_t stream = { 0 };
+        SWITCH_STANDARD_STREAM(stream);
+        switch_status_t status = switch_api_execute("uuid_broadcast", args, NULL, &stream);
+        const char* response = static_cast<const char*>(stream.data);
+        if (status != SWITCH_STATUS_SUCCESS || (response && !strncmp(response, "-ERR", 4))) {
+            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING,
+                "Backchannel playback failed for %s: %s\n", loop->uuid.c_str(), response ? response : "no response");
+        }
+        switch_safe_free(stream.data);
+    }
+    switch_core_session_rwunlock(session);
+}
+
+static void backchannel_loop_worker(const std::shared_ptr<BackchannelLoop>& loop) {
+    size_t promptIndex = 0;
+    const uint32_t intervalsMs[] = { 9000, 11000, 10000, 12000 };
+    const auto prompts = backchannel_prompts(loop->operation);
+    if (prompts.empty()) {
+        std::lock_guard<std::mutex> lock(loop->mutex);
+        loop->finished = true;
+        loop->condition.notify_all();
+        return;
+    }
+    while (true) {
+        {
+            std::lock_guard<std::mutex> lock(loop->mutex);
+            if (loop->stopping) break;
+        }
+        if (promptIndex >= loop->audioFiles.size()) {
+            switch_core_session_t* session = switch_core_session_locate(loop->uuid.c_str());
+            if (!session) break;
+            try {
+                loop->audioFiles.push_back(synthesize_backchannel_audio(
+                    session, loop->voice, loop->language, prompts[promptIndex]));
+            } catch (const std::exception& error) {
+                switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING,
+                    "Unable to synthesize backchannel phrase: %s\n", error.what());
+                if (loop->audioFiles.empty()) {
+                    switch_core_session_rwunlock(session);
+                    break;
+                }
+                loop->audioFiles.push_back(loop->audioFiles.front());
+            }
+            switch_core_session_rwunlock(session);
+        }
+        {
+            std::lock_guard<std::mutex> lock(loop->mutex);
+            if (loop->stopping) break;
+        }
+        const auto nextPromptTime = std::chrono::steady_clock::now() +
+            std::chrono::milliseconds(intervalsMs[promptIndex]);
+        backchannel_broadcast(loop, loop->audioFiles[promptIndex]);
+        const size_t nextPromptIndex = (promptIndex + 1) % prompts.size();
+        if (nextPromptIndex >= loop->audioFiles.size()) {
+            switch_core_session_t* session = switch_core_session_locate(loop->uuid.c_str());
+            if (!session) break;
+            try {
+                loop->audioFiles.push_back(synthesize_backchannel_audio(
+                    session, loop->voice, loop->language, prompts[nextPromptIndex]));
+            } catch (const std::exception& error) {
+                switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING,
+                    "Unable to synthesize backchannel phrase: %s\n", error.what());
+                if (loop->audioFiles.empty()) {
+                    switch_core_session_rwunlock(session);
+                    break;
+                }
+                loop->audioFiles.push_back(loop->audioFiles.front());
+            }
+            switch_core_session_rwunlock(session);
+        }
+        std::unique_lock<std::mutex> lock(loop->mutex);
+        const bool stopping = loop->condition.wait_until(lock,
+            nextPromptTime, [loop] { return loop->stopping; });
+        if (stopping) break;
+        promptIndex = nextPromptIndex;
+    }
+    {
+        std::lock_guard<std::mutex> lock(loop->mutex);
+        loop->finished = true;
+    }
+    loop->condition.notify_all();
+    std::lock_guard<std::mutex> loopsLock(backchannelLoopsMutex);
+    auto found = backchannelLoops.find(loop->uuid);
+    if (found != backchannelLoops.end() && found->second == loop) backchannelLoops.erase(found);
+}
+
+static void stop_backchannel_loop(const std::string& uuid) {
+    std::shared_ptr<BackchannelLoop> loop;
+    {
+        std::lock_guard<std::mutex> lock(backchannelLoopsMutex);
+        auto found = backchannelLoops.find(uuid);
+        if (found != backchannelLoops.end()) loop = found->second;
+    }
+    if (!loop) return;
+    {
+        std::lock_guard<std::mutex> lock(loop->mutex);
+        loop->stopping = true;
+    }
+    loop->condition.notify_all();
+    std::unique_lock<std::mutex> lock(loop->mutex);
+    loop->condition.wait_for(lock, std::chrono::seconds(6), [loop] { return loop->finished; });
+}
+
 static void killcb(struct cap_cb* cb) {
 	if (cb) {
 		if (cb->streamer) {
@@ -1262,6 +1547,7 @@ static void *SWITCH_THREAD_FUNC grpc_read_thread(switch_thread_t *thread, void *
             }
             // Optionally enrich with diagnostic_info and turn timing
             if (response.has_detect_intent_response()) {
+                        stop_backchannel(psession);
                         const auto& dir2 = response.detect_intent_response();
                         if (dir2.has_query_result()) {
                             const auto& qr2 = dir2.query_result();
@@ -1907,6 +2193,119 @@ static void *SWITCH_THREAD_FUNC grpc_read_thread(switch_thread_t *thread, void *
 }
 
 extern "C" {
+	switch_status_t google_dialogflow_backchannel_warmup(switch_core_session_t *session) {
+		switch_channel_t* channel = switch_core_session_get_channel(session);
+		const char* voiceValue = switch_channel_get_variable(channel, "DIALOGFLOW_TTS_VOICE_NAME");
+		const char* languageValue = switch_channel_get_variable(channel, "DIALOGFLOW_TTS_LANGUAGE");
+		if (zstr(voiceValue) || zstr(languageValue)) {
+			switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG,
+				"Skipping backchannel TTS warm-up because no explicit Dialogflow voice is configured\n");
+			return SWITCH_STATUS_FALSE;
+		}
+		const std::string voice(voiceValue);
+		const std::string language(languageValue);
+		const char* rateValue = switch_channel_get_variable(channel, "DIALOGFLOW_TTS_SPEAKING_RATE");
+		const char* pitchValue = switch_channel_get_variable(channel, "DIALOGFLOW_TTS_PITCH");
+		const char* volumeValue = switch_channel_get_variable(channel, "DIALOGFLOW_TTS_VOLUME_GAIN_DB");
+		const char* effectsValue = switch_channel_get_variable(channel, "DIALOGFLOW_TTS_EFFECTS_PROFILE_ID");
+		const std::string warmupKey = voice + "\n" + language + "\n" + (rateValue ? rateValue : "") + "\n" +
+			(pitchValue ? pitchValue : "") + "\n" + (volumeValue ? volumeValue : "") + "\n" +
+			(effectsValue ? effectsValue : "");
+		{
+			std::lock_guard<std::mutex> lock(backchannelWarmupMutex);
+			if (!backchannelWarmupVoices.insert(warmupKey).second) return SWITCH_STATUS_SUCCESS;
+		}
+		const std::string uuid = switch_core_session_get_uuid(session);
+		try {
+			std::thread warmupThread([uuid, voice, language]() {
+				switch_core_session_t* warmupSession = switch_core_session_locate(uuid.c_str());
+				if (!warmupSession) return;
+				const auto operations = { std::string("lookup"), std::string("payments") };
+				for (const auto& operation : operations) {
+					const auto prompts = backchannel_prompts(operation);
+					if (!prompts.empty()) {
+						try {
+							const std::string path = synthesize_backchannel_audio(warmupSession, voice, language, prompts.front());
+							switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(warmupSession), SWITCH_LOG_DEBUG,
+								"Warmed backchannel TTS cache for voice=%s operation=%s file=%s\n",
+								voice.c_str(), operation.c_str(), path.c_str());
+						} catch (const std::exception& error) {
+							switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(warmupSession), SWITCH_LOG_WARNING,
+								"Backchannel TTS warm-up failed for voice=%s operation=%s: %s\n",
+								voice.c_str(), operation.c_str(), error.what());
+						}
+					}
+				}
+				switch_core_session_rwunlock(warmupSession);
+			});
+			std::lock_guard<std::mutex> lock(backchannelWarmupMutex);
+			backchannelWarmupThreads.emplace_back(std::move(warmupThread));
+		} catch (const std::exception& error) {
+			switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING,
+				"Unable to start backchannel TTS warm-up: %s\n", error.what());
+			return SWITCH_STATUS_FALSE;
+		}
+		return SWITCH_STATUS_SUCCESS;
+	}
+
+	switch_status_t google_dialogflow_backchannel_start(switch_core_session_t *session, const char *operationValue) {
+		const std::string operation = operationValue ? operationValue : "";
+		const auto prompts = backchannel_prompts(operation);
+		if (prompts.empty()) return SWITCH_STATUS_FALSE;
+		switch_channel_t* channel = switch_core_session_get_channel(session);
+		const char* voiceValue = switch_channel_get_variable(channel, "DIALOGFLOW_TTS_VOICE_NAME");
+		const char* languageValue = switch_channel_get_variable(channel, "DIALOGFLOW_TTS_LANGUAGE");
+		if (zstr(voiceValue) || zstr(languageValue)) {
+			switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING,
+				"Operation backchannel requires an explicit Dialogflow TTS voice and language\n");
+			return SWITCH_STATUS_FALSE;
+		}
+
+		auto loop = std::make_shared<BackchannelLoop>();
+		loop->uuid = switch_core_session_get_uuid(session);
+		loop->operation = operation;
+		loop->voice = voiceValue;
+		loop->language = languageValue;
+		stop_backchannel_loop(loop->uuid);
+		{
+			std::lock_guard<std::mutex> lock(backchannelLoopsMutex);
+			if (backchannelLoops.find(loop->uuid) != backchannelLoops.end()) return SWITCH_STATUS_SUCCESS;
+			backchannelLoops[loop->uuid] = loop;
+		}
+		try {
+			std::thread worker(backchannel_loop_worker, loop);
+			worker.detach();
+		} catch (const std::exception& error) {
+			std::lock_guard<std::mutex> lock(backchannelLoopsMutex);
+			backchannelLoops.erase(loop->uuid);
+			switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
+				"Unable to start operation backchannel worker: %s\n", error.what());
+			return SWITCH_STATUS_FALSE;
+		}
+		switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO,
+			"Started intermittent operation backchannel: operation=%s voice=%s phrases=%zu interval=9-12s\n",
+			operation.c_str(), voiceValue, prompts.size());
+		return SWITCH_STATUS_SUCCESS;
+	}
+
+	void google_dialogflow_backchannel_stop(switch_core_session_t *session) {
+		if (!session) return;
+		switch_channel_t* channel = switch_core_session_get_channel(session);
+		const char* uuid = switch_core_session_get_uuid(session);
+		const char* active = switch_channel_get_variable(channel, "DIALOGFLOW_BACKCHANNEL_ACTIVE");
+		const switch_bool_t wasActive = (active && switch_true(active)) ? SWITCH_TRUE : SWITCH_FALSE;
+		switch_channel_set_variable(channel, "DIALOGFLOW_BACKCHANNEL_ACTIVE", NULL);
+		if (wasActive) {
+			switch_stream_handle_t stream = { 0 };
+			SWITCH_STANDARD_STREAM(stream);
+			(void) switch_api_execute("uuid_break", uuid, NULL, &stream);
+			switch_safe_free(stream.data);
+				switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO,
+				"Stopped backchannel playback\n");
+		}
+		stop_backchannel_loop(uuid ? uuid : "");
+	}
+
 	switch_status_t google_dialogflow_init() {
 		const char* gcsServiceKeyFile = std::getenv("GOOGLE_APPLICATION_CREDENTIALS");
 		if (NULL == gcsServiceKeyFile) {
@@ -1920,6 +2319,34 @@ extern "C" {
 	}
 	
 	switch_status_t google_dialogflow_cleanup() {
+		std::vector<std::thread> warmupThreads;
+		{
+			std::lock_guard<std::mutex> lock(backchannelWarmupMutex);
+			warmupThreads.swap(backchannelWarmupThreads);
+		}
+		for (auto& thread : warmupThreads) {
+			if (thread.joinable()) thread.join();
+		}
+		std::vector<std::shared_ptr<BackchannelLoop>> loops;
+		{
+			std::lock_guard<std::mutex> lock(backchannelLoopsMutex);
+			for (const auto& entry : backchannelLoops) loops.push_back(entry.second);
+		}
+		for (const auto& loop : loops) {
+			switch_core_session_t* session = switch_core_session_locate(loop->uuid.c_str());
+			if (session) {
+				google_dialogflow_backchannel_stop(session);
+				switch_core_session_rwunlock(session);
+			} else {
+				{
+					std::lock_guard<std::mutex> lock(loop->mutex);
+					loop->stopping = true;
+				}
+				loop->condition.notify_all();
+				std::unique_lock<std::mutex> lock(loop->mutex);
+				loop->condition.wait_for(lock, std::chrono::seconds(6), [loop] { return loop->finished; });
+			}
+		}
 		return SWITCH_STATUS_SUCCESS;
 	}
 
@@ -1985,6 +2412,7 @@ extern "C" {
         strncpy(cb->projectId, projectId, MAX_PROJECT_ID);
         try {
             cb->streamer = new GStreamer(session, lang, projectId, event, text, samples_per_second);
+            (void) google_dialogflow_backchannel_warmup(session);
         } catch (const std::exception& e) {
             switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_CRIT,
                 "Dialogflow init error (construction): %s. Emitting dialogflow::error and aborting.\n", e.what());
@@ -2083,6 +2511,7 @@ extern "C" {
 	switch_status_t google_dialogflow_session_stop(switch_core_session_t *session, int channelIsClosing) {
 		switch_channel_t *channel = switch_core_session_get_channel(session);
 		switch_media_bug_t *bug = (switch_media_bug_t*) switch_channel_get_private(channel, MY_BUG_NAME);
+		stop_backchannel(session);
 
 		if (bug) {
 			struct cap_cb *cb = (struct cap_cb *) switch_core_media_bug_get_user_data(bug);
@@ -2167,6 +2596,7 @@ extern "C" {
 		switch_frame_t frame = {};
 		struct cap_cb *cb = (struct cap_cb *) user_data;
 		switch_bool_t stop_interruptible_playback = SWITCH_FALSE;
+		switch_bool_t stop_active_backchannel = SWITCH_FALSE;
 
 		frame.data = data;
 		frame.buflen = SWITCH_RECOMMENDED_BUFFER_SIZE;
@@ -2181,7 +2611,10 @@ extern "C" {
 						spx_uint32_t in_len = frame.samples;
 						
 						speex_resampler_process_interleaved_int(cb->resampler, (const spx_int16_t *) frame.data, (spx_uint32_t *) &in_len, &out[0], &out_len);
-						if (cb->interruptible_playback_active && cb->barge_vad_enabled && cb->vad && out_len > 0) {
+						const char* backchannelActive = switch_channel_get_variable(
+							switch_core_session_get_channel(session), "DIALOGFLOW_BACKCHANNEL_ACTIVE");
+						switch_bool_t backchannelPlaying = (backchannelActive && switch_true(backchannelActive)) ? SWITCH_TRUE : SWITCH_FALSE;
+						if ((cb->interruptible_playback_active || backchannelPlaying) && cb->barge_vad_enabled && cb->vad && out_len > 0) {
 							switch_vad_state_t vadState = switch_vad_process(cb->vad, &out[0], (unsigned int) out_len);
 							if (cb->vad_debug &&
 								(vadState == SWITCH_VAD_STATE_START_TALKING || vadState == SWITCH_VAD_STATE_STOP_TALKING)) {
@@ -2204,11 +2637,12 @@ extern "C" {
 									cb->vad_talking_ms += (uint64_t)(samples_to_ms(out_len, streamer->sampleRate()) + 0.5);
 									if (!stop_interruptible_playback && cb->vad_talking_ms >= cb->barge_vad_hold_ms) {
 										stop_interruptible_playback = SWITCH_TRUE;
+										stop_active_backchannel = backchannelPlaying;
 										cb->last_local_barge_break_ms = current_time_ms();
 										reset_interruptible_playback_state(cb);
 										switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO,
-											"google_dialogflow_frame: local VAD barge-in triggered after %" PRIu64 "ms of playback and %" PRIu64 "ms of speech (hold=%ums)\n",
-											elapsedMs, cb->vad_talking_ms, cb->barge_vad_hold_ms);
+											"google_dialogflow_frame: local VAD barge-in triggered after %" PRIu64 "ms of playback and %" PRIu64 "ms of speech (hold=%ums backchannel=%s)\n",
+											elapsedMs, cb->vad_talking_ms, cb->barge_vad_hold_ms, backchannelPlaying ? "true" : "false");
 									}
 								} else {
 									cb->vad_talking_ms = 0;
@@ -2233,7 +2667,11 @@ extern "C" {
 			//	"google_dialogflow_frame: not sending audio since failed to get lock on mutex\n");
 		}
 		if (stop_interruptible_playback) {
-			stop_playback(session);
+			if (stop_active_backchannel) {
+				stop_backchannel(session);
+			} else {
+				stop_playback(session);
+			}
 		}
 	return SWITCH_TRUE;
 }
