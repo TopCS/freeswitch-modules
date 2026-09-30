@@ -70,7 +70,7 @@ Prints the module version, git hash, build date and build type, e.g.:
 `mod_dialogflow/1.0.0 (git a1b2c3d, built 2025-08-14T10:22:33Z, Release)`
 
 #### Backchannel event (ESL)
-The module subscribes to the `CUSTOM` subclass `mod_dialogflow::backchannel`, so the orchestrator does not need to relay these commands. The backend that knows the operation lifecycle (e.g. Node-RED) sends events over ESL:
+The module subscribes to the `CUSTOM` subclass `mod_dialogflow::backchannel`, so the orchestrator does not need to relay these commands. The backend that knows the operation lifecycle (e.g. Node-RED) sends events over ESL. Start the operation prompt immediately before the slow API call:
 
 ```text
 sendevent CUSTOM
@@ -82,6 +82,18 @@ Operation: lookup
 ```
 
 Use `Operation: lookup` for a claim, license plate, or other data lookup, and `Operation: payments` for payment details. Enable Cloud Text-to-Speech and grant the module credentials permission to use it. The module synthesizes short operation-specific phrases using the voice, language, speaking rate, pitch, volume, and effects profile selected by `dialogflow_start`; it caches resulting WAV files by voice, phrase, and settings, and warms the first phrase for each operation in the background when the session starts. While the operation remains pending, it cycles through varied short phrases at irregular 9–12 second intervals, synthesizing the next phrase while the current one plays. Send another event with the same `Event-Subclass`, `Unique-ID`, and `Action: stop` when the operation completes. The module also stops playback on caller speech when local barge VAD is enabled and before playing a Dialogflow response.
+
+**The module cannot detect that a backend API has returned.** It keeps cycling until it receives `Action: stop` or a Dialogflow response arrives. Therefore, the backend should send the stop event as soon as its API call completes, before returning the result to Dialogflow; this prevents extra fillers during the agent's post-tool response generation. For example:
+
+```text
+sendevent CUSTOM
+Event-Subclass: mod_dialogflow::backchannel
+Unique-ID: <same-freeswitch-channel-uuid>
+Action: stop
+
+```
+
+Both events require the FreeSWITCH channel UUID in `Unique-ID`. If the backend is invoked by a Dialogflow tool, make that UUID available to the tool request or maintain a reliable call-to-session mapping; `caller_number` alone is not a safe session key. The module uses the WAV header to track prompt duration and only sends `uuid_break` when a synthesized prompt is still playing, avoiding a stale break interrupting the following Dialogflow audio. A short API may complete before the next 9–12 second prompt is due, so hearing just the initial phrase is expected.
 
 For a fixed audio prompt, send `Audio-File: /var/lib/freeswitch/sounds/backchannel.wav` instead of `Operation`; the one-shot `dialogflow_backchannel <uuid> start <audio-file>` / `dialogflow_backchannel <uuid> stop` API remains available. Operation playback can also be controlled with `dialogflow_backchannel <uuid> start-operation <lookup|payments>`.
 
@@ -157,7 +169,7 @@ if (typeof data?.body === 'string' && data.body.trim().startsWith('{')) {
 - `DIALOGFLOW_PARAMS`: Optional JSON string merged into `QueryParameters.parameters` on start.
 - `DIALOGFLOW_AUTOPLAY`: If `true`, auto-play returned TTS on the A-leg.
 - `DIALOGFLOW_AUTOPLAY_SYNC`: When `true` and `DIALOGFLOW_AUTOPLAY` is enabled, play the agent audio synchronously and block the next user turn until playback completes. Defaults to `true` when `DIALOGFLOW_AUTOPLAY` is set. Set to `false` to retain legacy async `uuid_broadcast` behavior.
-- `dialogflow_backchannel <uuid> start <audio-file>` starts a one-shot local prompt asynchronously on the A-leg. `start-operation <lookup|payments>` instead synthesizes and alternates short phrases using the session's configured Dialogflow voice. The generated audio is cached in `/tmp` per voice, language, phrase, and speech settings; the first phrase for each operation is warmed asynchronously after session startup. Both modes stop when requested, on caller speech when local barge VAD is enabled, or before an incoming Dialogflow response is played. Playback uses the normal FreeSWITCH audio path, not `uuid_displace`.
+- `dialogflow_backchannel <uuid> start <audio-file>` starts a one-shot local prompt asynchronously on the A-leg. `start-operation <lookup|payments>` instead synthesizes and alternates short phrases using the session's configured Dialogflow voice. The generated audio is cached in `/tmp` per voice, language, phrase, and speech settings; the first phrase for each operation is warmed asynchronously after session startup. For backend operations, explicitly send `stop` as soon as the backend returns; stopping on the eventual Dialogflow response is only a fallback. Both modes stop on caller speech when local barge VAD is enabled. Playback uses the normal FreeSWITCH audio path, not `uuid_displace`.
 - `DIALOGFLOW_BARGE_IN`: When `true`, enable Dialogflow CX barge-in for interruptible prompts during autoplay. For synchronous autoplay, the module starts the next CX stream before playback and sends `InputAudioConfig.barge_in_config` using the actual prompt duration. Defaults to `false`.
 - `DIALOGFLOW_BARGE_IN_NO_BARGE_MS`: Optional initial guard window in milliseconds for the native CX barge-in config. Defaults to `0`.
 - `DIALOGFLOW_BARGE_IN_FORCE`: When `true`, force native barge-in even if the Dialogflow response messages do not mark the prompt as interruptible via `allow_playback_interruption`. Defaults to `false`.

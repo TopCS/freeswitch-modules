@@ -79,6 +79,7 @@ struct BackchannelLoop {
     std::vector<std::string> audioFiles;
     std::mutex mutex;
     std::condition_variable condition;
+    std::chrono::steady_clock::time_point playbackUntil{};
     bool stopping = false;
     bool finished = false;
 };
@@ -191,6 +192,15 @@ static bool get_wav_duration_ms(const std::string& audio, uint64_t* durationMs, 
         *durationMs = (sampleFrames * 1000ULL) / sampleRate;
     }
     return true;
+}
+
+static bool get_wav_file_duration_ms(const std::string& path, uint64_t* durationMs, uint32_t* detectedRate = nullptr) {
+    std::ifstream audioFile(path, std::ios::binary);
+    if (!audioFile.good()) {
+        return false;
+    }
+    const std::string audio((std::istreambuf_iterator<char>(audioFile)), std::istreambuf_iterator<char>());
+    return get_wav_duration_ms(audio, durationMs, detectedRate);
 }
 
 static bool get_audio_file_duration_ms(const std::string& path, uint32_t fallbackRate, uint64_t* durationMs, uint32_t* detectedRate = nullptr) {
@@ -1310,15 +1320,30 @@ static void backchannel_broadcast(const std::shared_ptr<BackchannelLoop>& loop, 
     switch_core_session_t* session = switch_core_session_locate(loop->uuid.c_str());
     if (!session) return;
     switch_channel_t* channel = switch_core_session_get_channel(session);
-    const char* active = switch_channel_get_variable(channel, "DIALOGFLOW_BACKCHANNEL_ACTIVE");
-    if (switch_channel_ready(channel) && active && switch_true(active)) {
+    uint64_t durationMs = 0;
+    if (!get_wav_file_duration_ms(path, &durationMs)) {
+        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING,
+            "Unable to determine backchannel prompt duration for %s; will not issue a playback break on stop\n",
+            path.c_str());
+    }
+    {
+        std::unique_lock<std::mutex> lock(loop->mutex);
+        const char* active = switch_channel_get_variable(channel, "DIALOGFLOW_BACKCHANNEL_ACTIVE");
+        if (loop->stopping || !switch_channel_ready(channel) || !active || !switch_true(active)) {
+            switch_core_session_rwunlock(session);
+            return;
+        }
         char args[MAX_PATHLEN + 300];
         snprintf(args, sizeof(args), "%s %s aleg", loop->uuid.c_str(), path.c_str());
         switch_stream_handle_t stream = { 0 };
         SWITCH_STANDARD_STREAM(stream);
+        loop->playbackUntil = durationMs
+            ? std::chrono::steady_clock::now() + std::chrono::milliseconds(durationMs + 250)
+            : std::chrono::steady_clock::now();
         switch_status_t status = switch_api_execute("uuid_broadcast", args, NULL, &stream);
         const char* response = static_cast<const char*>(stream.data);
         if (status != SWITCH_STATUS_SUCCESS || (response && !strncmp(response, "-ERR", 4))) {
+            loop->playbackUntil = std::chrono::steady_clock::time_point{};
             switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING,
                 "Backchannel playback failed for %s: %s\n", loop->uuid.c_str(), response ? response : "no response");
         }
@@ -1415,6 +1440,24 @@ static void stop_backchannel_loop(const std::string& uuid) {
     loop->condition.notify_all();
     std::unique_lock<std::mutex> lock(loop->mutex);
     loop->condition.wait_for(lock, std::chrono::seconds(6), [loop] { return loop->finished; });
+}
+
+static bool request_backchannel_loop_stop(const std::string& uuid) {
+    std::shared_ptr<BackchannelLoop> loop;
+    {
+        std::lock_guard<std::mutex> lock(backchannelLoopsMutex);
+        auto found = backchannelLoops.find(uuid);
+        if (found != backchannelLoops.end()) loop = found->second;
+    }
+    if (!loop) return false;
+    bool playbackActive = false;
+    {
+        std::lock_guard<std::mutex> lock(loop->mutex);
+        playbackActive = std::chrono::steady_clock::now() < loop->playbackUntil;
+        loop->stopping = true;
+    }
+    loop->condition.notify_all();
+    return playbackActive;
 }
 
 static void killcb(struct cap_cb* cb) {
@@ -2293,14 +2336,25 @@ extern "C" {
 		switch_channel_t* channel = switch_core_session_get_channel(session);
 		const char* uuid = switch_core_session_get_uuid(session);
 		const char* active = switch_channel_get_variable(channel, "DIALOGFLOW_BACKCHANNEL_ACTIVE");
+		const char* operation = switch_channel_get_variable(channel, "DIALOGFLOW_BACKCHANNEL_OPERATION");
 		const switch_bool_t wasActive = (active && switch_true(active)) ? SWITCH_TRUE : SWITCH_FALSE;
+		const switch_bool_t operationBackchannel = (operation && switch_true(operation)) ? SWITCH_TRUE : SWITCH_FALSE;
 		switch_channel_set_variable(channel, "DIALOGFLOW_BACKCHANNEL_ACTIVE", NULL);
+		switch_channel_set_variable(channel, "DIALOGFLOW_BACKCHANNEL_OPERATION", NULL);
 		if (wasActive) {
-			switch_stream_handle_t stream = { 0 };
-			SWITCH_STANDARD_STREAM(stream);
-			(void) switch_api_execute("uuid_break", uuid, NULL, &stream);
-			switch_safe_free(stream.data);
-				switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO,
+			const bool playbackActive = operationBackchannel
+				? request_backchannel_loop_stop(uuid ? uuid : "")
+				: true;
+			if (playbackActive) {
+				switch_stream_handle_t stream = { 0 };
+				SWITCH_STANDARD_STREAM(stream);
+				(void) switch_api_execute("uuid_break", uuid, NULL, &stream);
+				switch_safe_free(stream.data);
+			} else {
+				switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG,
+					"Skipping uuid_break because no backchannel prompt is currently playing\n");
+			}
+			switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO,
 				"Stopped backchannel playback\n");
 		}
 		stop_backchannel_loop(uuid ? uuid : "");

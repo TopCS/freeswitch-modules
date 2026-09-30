@@ -58,9 +58,11 @@ static switch_status_t dialogflow_backchannel_control(switch_core_session_t *ses
 		if (!switch_channel_ready(channel)) return SWITCH_STATUS_FALSE;
 		if (active && switch_true(active)) return SWITCH_STATUS_SUCCESS;
 		switch_channel_set_variable(channel, "DIALOGFLOW_BACKCHANNEL_ACTIVE", "true");
+		switch_channel_set_variable(channel, "DIALOGFLOW_BACKCHANNEL_OPERATION", "true");
 		status = google_dialogflow_backchannel_start(session, value);
 		if (status != SWITCH_STATUS_SUCCESS) {
 			switch_channel_set_variable(channel, "DIALOGFLOW_BACKCHANNEL_ACTIVE", NULL);
+			switch_channel_set_variable(channel, "DIALOGFLOW_BACKCHANNEL_OPERATION", NULL);
 		}
 	} else if (!strcmp(action, "start")) {
 		if (!value || zstr(value) || strlen(value) > MAX_PATHLEN || strpbrk(value, " \t\r\n")) {
@@ -74,6 +76,7 @@ static switch_status_t dialogflow_backchannel_control(switch_core_session_t *ses
 		if (active && switch_true(active)) {
 			return SWITCH_STATUS_SUCCESS;
 		}
+		switch_channel_set_variable(channel, "DIALOGFLOW_BACKCHANNEL_OPERATION", NULL);
 		switch_channel_set_variable(channel, "DIALOGFLOW_BACKCHANNEL_ACTIVE", "true");
 		snprintf(args, sizeof(args), "%s %s aleg", uuid, value);
 		SWITCH_STANDARD_STREAM(api_stream);
